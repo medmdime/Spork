@@ -1,0 +1,11 @@
+[package]
+name = "spork"
+description = "Spork: neither a spoon nor a fork, just a better Git client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+spork-git = { path = "../../crates/spork-git" }
+gpui-kit = "0.9.1"
