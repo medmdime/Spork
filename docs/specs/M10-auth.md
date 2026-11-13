@@ -11,7 +11,7 @@ Phase: P2 (spike in week 1 on Windows). Components: `Dialog`, `Input` (masked), 
 
 ## 2. `spork-askpass` protocol
 - Invoked by git as `spork-askpass "<prompt>"`, by ssh as `SSH_ASKPASS` with `SSH_ASKPASS_REQUIRE=force` (also set `DISPLAY=:0` on Linux if unset, required by older OpenSSH).
-- Connects to `$SPORK_IPC` (Unix socket in runtime dir with 0600 / Windows named pipe with an ACL for the current user), sends
+- Connects to `$SPORK_IPC` (a localhost TCP port opened by the app, guarded by a random per-launch token in `$SPORK_IPC_TOKEN`; std-only and identical on every OS), sends
   `{"v":1,"kind":"askpass","job":"<job id>","prompt":"Password for 'https://u@github.com': ","repo":"/path"}`, receives `{"answer":"…"}` or `{"cancel":true}`.
 - Prints the answer + `\n` to stdout, exit 0; cancel → exit 1. Timeout 5 min. Never logs the answer.
 - Prompt classification: `Username for` / `Password for` / `Enter passphrase for key '<path>'` / `Are you sure you want to continue connecting (yes/no` (host key → show fingerprint dialog, answer `yes`/`no`) / `Verification code` (2FA).

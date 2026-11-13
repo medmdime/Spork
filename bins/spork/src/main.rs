@@ -1,5 +1,6 @@
 //! Spork desktop app. P1: repository sidebar (docs/specs/M03) and commit list with graph (M05).
 
+mod askpass;
 mod branches;
 mod changes;
 mod history;
@@ -55,6 +56,9 @@ struct RepoView {
     subject: Entity<InputState>,
     /// Name field of the "New branch" dialog (branches.rs).
     branch_name: Entity<InputState>,
+    /// Answer field of git's password / passphrase prompts (askpass.rs).
+    prompt_input: Entity<InputState>,
+    _prompts: Option<Task<()>>,
     description: Entity<TextareaState>,
     amend: bool,
     /// A git write (stage, commit…) is running.
@@ -72,7 +76,12 @@ struct Loaded {
 }
 
 impl RepoView {
-    fn new(requested: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        requested: PathBuf,
+        prompts: Option<smol::channel::Receiver<askpass::Prompt>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // follow the OS light/dark setting live
         let _appearance = cx.observe_window_appearance(window, |_, window, cx| {
             Theme::sync_system_appearance(Some(window), cx)
@@ -104,6 +113,15 @@ impl RepoView {
             _diff_events,
             subject: cx.new(|cx| InputState::new(window, cx).placeholder("Commit subject")),
             branch_name: cx.new(|cx| InputState::new(window, cx).placeholder("feature/my-change")),
+            prompt_input: cx.new(|cx| InputState::new(window, cx)),
+            _prompts: prompts.map(|rx| {
+                cx.spawn_in(window, async move |this, cx| {
+                    while let Ok((prompt, reply)) = rx.recv().await {
+                        this.update_in(cx, |this, window, cx| this.ask(prompt, reply, window, cx))
+                            .ok();
+                    }
+                })
+            }),
             description: cx
                 .new(|cx| TextareaState::new(window, cx).placeholder("Description (optional)")),
             amend: false,
@@ -692,6 +710,10 @@ fn install_theme(cx: &mut App) {
 }
 
 fn main() {
+    // git runs this same binary as GIT_ASKPASS / SSH_ASKPASS: answer and exit, no UI
+    if std::env::var_os(spork_git::askpass::HELPER_ENV).is_some() {
+        std::process::exit(spork_git::askpass::helper_main());
+    }
     let requested = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
@@ -711,7 +733,8 @@ fn main() {
             // open_window wraps the view in gpui-kit's Root (themes, dialogs, notifications)
             gpui_kit::open_window(options, cx, move |window, cx| {
                 Theme::sync_system_appearance(Some(window), cx);
-                cx.new(|cx| RepoView::new(requested, window, cx))
+                let prompts = askpass::start();
+                cx.new(|cx| RepoView::new(requested, prompts, window, cx))
             })
             .expect("failed to open window");
             cx.activate(true);

@@ -100,6 +100,7 @@ pub fn run_with_input(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    askpass::configure(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| GitError::GitMissing(e.to_string()))?;
@@ -666,6 +667,178 @@ pub fn create_branch(
 /// Deletes a local branch; git refuses if it isn't merged anywhere (no data loss).
 pub fn delete_branch(repo: &Path, name: &str) -> Result<(), GitError> {
     run(repo, &["branch", "--delete", name]).map(drop)
+}
+
+/// Password / passphrase prompts from git and ssh, answered by Spork's UI (docs/specs/M10).
+///
+/// Git runs the Spork binary itself as `GIT_ASKPASS` / `SSH_ASKPASS` (with `SPORK_ASKPASS=1`).
+/// That helper sends the prompt to the running app over a localhost connection guarded by a
+/// random per-launch token, and prints the answer for git. Standard library only, same on
+/// every OS.
+pub mod askpass {
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    /// Marks a process started by git as the askpass helper.
+    pub const HELPER_ENV: &str = "SPORK_ASKPASS";
+    const ADDR_ENV: &str = "SPORK_IPC";
+    const TOKEN_ENV: &str = "SPORK_IPC_TOKEN";
+
+    #[derive(Debug, Clone)]
+    pub struct Config {
+        /// Program git runs for prompts (the Spork executable).
+        pub program: PathBuf,
+        pub addr: String,
+        pub token: String,
+    }
+
+    static CONFIG: OnceLock<Config> = OnceLock::new();
+
+    /// Routes prompts of every git command started after this call to the app.
+    pub fn install(config: Config) {
+        CONFIG.set(config).ok();
+    }
+
+    pub(crate) fn configure(cmd: &mut Command) {
+        let Some(c) = CONFIG.get() else { return };
+        cmd.env("GIT_ASKPASS", &c.program)
+            .env("SSH_ASKPASS", &c.program)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env(HELPER_ENV, "1")
+            .env(ADDR_ENV, &c.addr)
+            .env(TOKEN_ENV, &c.token);
+        // older OpenSSH only uses SSH_ASKPASS when DISPLAY is set
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("DISPLAY").is_none() {
+            cmd.env("DISPLAY", ":0");
+        }
+    }
+
+    /// 128 random bits as hex, from the OS-seeded hasher keys (no extra dependency).
+    pub fn random_token() -> String {
+        use std::hash::{BuildHasher, Hasher};
+        (0..2u64)
+            .map(|i| {
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write_u64(i);
+                format!("{:016x}", h.finish())
+            })
+            .collect()
+    }
+
+    fn escape(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+    }
+
+    fn unescape(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            match (c, c == '\\') {
+                (_, true) => match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some(other) => out.push(other),
+                    None => {}
+                },
+                (c, false) => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// App side: answers prompts arriving on `listener`; `ask` returns the answer, `None` cancels.
+    /// Connections without the right token are dropped.
+    pub fn serve(listener: TcpListener, token: &str, ask: impl Fn(String) -> Option<String>) {
+        for stream in listener.incoming().flatten() {
+            handle(stream, token, &ask).ok();
+        }
+    }
+
+    fn handle(
+        stream: TcpStream,
+        token: &str,
+        ask: &impl Fn(String) -> Option<String>,
+    ) -> io::Result<()> {
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line)?;
+        let Some((sent, prompt)) = line.trim_end_matches('\n').split_once('\t') else {
+            return Ok(());
+        };
+        if sent != token {
+            return Ok(());
+        }
+        let reply = match ask(unescape(prompt)) {
+            Some(answer) => format!("OK\t{}\n", escape(&answer)),
+            None => "CANCEL\n".to_owned(),
+        };
+        (&stream).write_all(reply.as_bytes())
+    }
+
+    /// Helper side (run by git): asks the app. `None` when cancelled or the app is unreachable.
+    pub fn request(addr: &str, token: &str, prompt: &str) -> Option<String> {
+        let mut stream = TcpStream::connect(addr).ok()?;
+        stream
+            .write_all(format!("{token}\t{}\n", escape(prompt)).as_bytes())
+            .ok()?;
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).ok()?;
+        line.trim_end_matches('\n')
+            .strip_prefix("OK\t")
+            .map(unescape)
+    }
+
+    /// Entry point when git runs Spork as askpass: prints the answer, exit code 1 on cancel.
+    pub fn helper_main() -> i32 {
+        let prompt = std::env::args().nth(1).unwrap_or_default();
+        let (Ok(addr), Ok(token)) = (std::env::var(ADDR_ENV), std::env::var(TOKEN_ENV)) else {
+            return 1;
+        };
+        match request(&addr, &token, &prompt) {
+            Some(answer) => {
+                println!("{answer}");
+                0
+            }
+            None => 1,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn prompt_round_trip_cancel_and_wrong_token() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let token = random_token();
+            assert_eq!(token.len(), 32);
+            let server_token = token.clone();
+            std::thread::spawn(move || {
+                serve(listener, &server_token, |prompt| match prompt.as_str() {
+                    "Password for 'https://u@host':" => Some("s3cr\tet\\x".into()),
+                    _ => None,
+                })
+            });
+            assert_eq!(
+                request(&addr, &token, "Password for 'https://u@host':").as_deref(),
+                Some("s3cr\tet\\x")
+            );
+            assert_eq!(request(&addr, &token, "Username for 'https://host':"), None); // cancelled
+            assert_eq!(
+                request(&addr, "wrong-token", "Password for 'https://u@host':"),
+                None
+            );
+            assert_ne!(random_token(), token);
+        }
+    }
 }
 
 #[cfg(test)]
