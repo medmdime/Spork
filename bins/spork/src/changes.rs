@@ -511,25 +511,13 @@ impl RepoView {
                 }))
         };
         let buttons = if staged {
-            h_flex().gap_2().child(
-                action(
-                    "unstage-lines",
-                    "Unstage lines",
-                    PatchTarget::Unstage,
-                )
-                .primary(),
-            )
+            h_flex()
+                .gap_2()
+                .child(action("unstage-lines", "Unstage lines", PatchTarget::Unstage).primary())
         } else {
             h_flex()
                 .gap_2()
-                .child(
-                    action(
-                        "discard-lines",
-                        "Discard lines…",
-                        PatchTarget::Discard,
-                    )
-                    .ghost(),
-                )
+                .child(action("discard-lines", "Discard lines…", PatchTarget::Discard).ghost())
                 .child(action("stage-lines", "Stage lines", PatchTarget::Stage).primary())
         };
         Some(bar.child(label).child(buttons))
