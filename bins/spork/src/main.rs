@@ -1,5 +1,6 @@
 //! Spork desktop app. P1: repository sidebar (docs/specs/M03) and commit list with graph (M05).
 
+mod branches;
 mod changes;
 mod history;
 
@@ -49,6 +50,8 @@ struct RepoView {
     change_diff: Entity<DiffState>,
     _change_diff_load: Option<Task<()>>,
     subject: Entity<InputState>,
+    /// Name field of the "New branch" dialog (branches.rs).
+    branch_name: Entity<InputState>,
     description: Entity<TextareaState>,
     amend: bool,
     /// A git write (stage, commit…) is running.
@@ -85,6 +88,7 @@ impl RepoView {
             change_diff: cx.new(|cx| DiffState::new([], cx)),
             _change_diff_load: None,
             subject: cx.new(|cx| InputState::new(window, cx).placeholder("Commit subject")),
+            branch_name: cx.new(|cx| InputState::new(window, cx).placeholder("feature/my-change")),
             description: cx
                 .new(|cx| TextareaState::new(window, cx).placeholder("Description (optional)")),
             amend: false,
@@ -259,7 +263,7 @@ fn load(path: &Path) -> Result<Loaded, GitError> {
     })
 }
 
-fn branch_item(r: &Ref) -> SidebarMenuItem {
+fn branch_item(r: &Ref, view: &Entity<RepoView>) -> SidebarMenuItem {
     let label = r
         .name
         .rsplit_once('/')
@@ -274,7 +278,8 @@ fn branch_item(r: &Ref) -> SidebarMenuItem {
     };
     let item = SidebarMenuItem::new(label)
         .icon(IconName::GitBranch)
-        .active(r.is_head);
+        .active(r.is_head)
+        .context_menu(branches::ref_menu(r, view.clone()));
     if badge.is_empty() {
         item
     } else {
@@ -283,7 +288,7 @@ fn branch_item(r: &Ref) -> SidebarMenuItem {
 }
 
 /// Groups `a/b/c` names into folders, as in M03 §1 (`feature/login` → `feature ▸ login`).
-fn folder_tree(refs: &[&Ref], depth: usize) -> Vec<SidebarMenuItem> {
+fn folder_tree(refs: &[&Ref], depth: usize, view: &Entity<RepoView>) -> Vec<SidebarMenuItem> {
     let mut folders: BTreeMap<&str, Vec<&Ref>> = BTreeMap::new();
     let mut leaves = Vec::new();
     for r in refs {
@@ -291,7 +296,7 @@ fn folder_tree(refs: &[&Ref], depth: usize) -> Vec<SidebarMenuItem> {
             Some(seg) if r.name.split('/').count() > depth + 1 => {
                 folders.entry(seg).or_default().push(r)
             }
-            _ => leaves.push(branch_item(r)),
+            _ => leaves.push(branch_item(r, view)),
         }
     }
     let mut items: Vec<SidebarMenuItem> = folders
@@ -300,7 +305,7 @@ fn folder_tree(refs: &[&Ref], depth: usize) -> Vec<SidebarMenuItem> {
             SidebarMenuItem::new(name.to_owned())
                 .icon(IconName::Folder)
                 .click_to_toggle(true)
-                .children(folder_tree(&inner, depth + 1))
+                .children(folder_tree(&inner, depth + 1, view))
         })
         .collect();
     items.extend(leaves);
@@ -369,11 +374,16 @@ impl RepoView {
                 .filter(move |r: &&Ref| r.kind == kind)
                 .collect::<Vec<_>>()
         };
+        let view = cx.entity();
         let locals = of(RefKind::Local);
         let remotes = of(RefKind::Remote);
         let tags: Vec<_> = of(RefKind::Tag)
             .iter()
-            .map(|t| SidebarMenuItem::new(t.name.clone()).icon(IconName::Tag))
+            .map(|t| {
+                SidebarMenuItem::new(t.name.clone())
+                    .icon(IconName::Tag)
+                    .context_menu(branches::ref_menu(t, view.clone()))
+            })
             .collect();
         let name = repo.root.file_name().map_or_else(
             || repo.root.display().to_string(),
@@ -423,13 +433,13 @@ impl RepoView {
                         "Branches",
                         locals.len(),
                         IconName::GitBranch,
-                        folder_tree(&locals, 0),
+                        folder_tree(&locals, 0, &view),
                     ),
                     section(
                         "Remotes",
                         remotes.len(),
                         IconName::Globe,
-                        folder_tree(&remotes, 0),
+                        folder_tree(&remotes, 0, &view),
                     ),
                     section("Tags", tags.len(), IconName::Tag, tags),
                 ]),

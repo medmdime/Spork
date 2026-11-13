@@ -564,6 +564,63 @@ pub fn push(repo: &Path) -> Result<String, GitError> {
     Ok(format!("Pushed {branch} to {remote}"))
 }
 
+/// Switches to a local branch (docs/specs/M04 §2). Git refuses if local changes would be overwritten.
+pub fn checkout(repo: &Path, branch: &str) -> Result<(), GitError> {
+    run(repo, &["switch", "--no-guess", branch]).map(drop)
+}
+
+/// Checks out a remote branch such as `origin/feature/x`: switches to the local branch of the same
+/// name if it exists, otherwise creates it tracking the remote one (M04 §3). Returns the local name.
+pub fn checkout_remote(repo: &Path, remote_branch: &str) -> Result<String, GitError> {
+    let local = remote_branch
+        .split_once('/')
+        .map_or(remote_branch, |(_, b)| b)
+        .to_owned();
+    let exists = run(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{local}"),
+        ],
+    )
+    .is_ok();
+    if exists {
+        checkout(repo, &local)?;
+    } else {
+        run(repo, &["switch", "--track", remote_branch])?;
+    }
+    Ok(local)
+}
+
+/// Creates `name` at `start` (default HEAD), optionally switching to it (M04 §1).
+pub fn create_branch(
+    repo: &Path,
+    name: &str,
+    start: Option<&str>,
+    switch: bool,
+) -> Result<(), GitError> {
+    if run(repo, &["check-ref-format", "--branch", name]).is_err() {
+        return Err(GitError::Other {
+            code: None,
+            stderr: format!("`{name}` is not a valid branch name."),
+        });
+    }
+    let mut args = if switch {
+        vec!["switch", "-c", name]
+    } else {
+        vec!["branch", name]
+    };
+    args.extend(start);
+    run(repo, &args).map(drop)
+}
+
+/// Deletes a local branch; git refuses if it isn't merged anywhere (no data loss).
+pub fn delete_branch(repo: &Path, name: &str) -> Result<(), GitError> {
+    run(repo, &["branch", "--delete", name]).map(drop)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +911,55 @@ mod tests {
         push(&b).unwrap();
         git(&a, &["commit", "-q", "--allow-empty", "-m", "local"]);
         assert_eq!(push(&a).unwrap_err(), GitError::NonFastForward);
+    }
+
+    #[test]
+    fn branch_checkout_create_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["commit", "-q", "--allow-empty", "-m", "one"]);
+
+        create_branch(d, "feature/x", None, false).unwrap();
+        assert_eq!(head_branch(d).unwrap().as_deref(), Some("main"));
+        create_branch(d, "feature/y", Some("main"), true).unwrap();
+        assert_eq!(head_branch(d).unwrap().as_deref(), Some("feature/y"));
+        assert!(
+            create_branch(d, "bad..name", None, false)
+                .unwrap_err()
+                .to_string()
+                .contains("not a valid")
+        );
+
+        checkout(d, "feature/x").unwrap();
+        assert_eq!(head_branch(d).unwrap().as_deref(), Some("feature/x"));
+
+        // unmerged branch: git refuses to delete it
+        checkout(d, "feature/y").unwrap();
+        git(d, &["commit", "-q", "--allow-empty", "-m", "only on y"]);
+        checkout(d, "main").unwrap();
+        assert!(delete_branch(d, "feature/y").is_err());
+        delete_branch(d, "feature/x").unwrap();
+        assert!(!refs(d).unwrap().iter().any(|r| r.name == "feature/x"));
+
+        // remote branch: creates a tracking branch, then reuses it
+        git(
+            d,
+            &["remote", "add", "origin", "https://example.invalid/r.git"],
+        );
+        git(d, &["update-ref", "refs/remotes/origin/feature/z", "HEAD"]);
+        assert_eq!(checkout_remote(d, "origin/feature/z").unwrap(), "feature/z");
+        let z = refs(d)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "feature/z")
+            .unwrap();
+        assert_eq!(
+            (z.is_head, z.upstream.as_deref()),
+            (true, Some("origin/feature/z"))
+        );
+        checkout(d, "main").unwrap();
+        assert_eq!(checkout_remote(d, "origin/feature/z").unwrap(), "feature/z");
     }
 
     #[test]
