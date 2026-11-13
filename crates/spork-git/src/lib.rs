@@ -460,6 +460,29 @@ fn with_pathspecs(repo: &Path, args: &[&str], paths: &[&str]) -> Result<(), GitE
     run_with_input(repo, &args, Some(&input)).map(drop)
 }
 
+/// Throws away unstaged changes (docs/specs/M07 §3): tracked files go back to their staged/committed
+/// content; untracked files are moved to the system Trash, never deleted outright.
+pub fn discard(repo: &Path, entries: &[StatusEntry]) -> Result<(), GitError> {
+    let tracked: Vec<&str> = entries
+        .iter()
+        .filter(|e| !e.untracked() && !e.conflicted && e.worktree != '.')
+        .map(|e| e.path.as_str())
+        .collect();
+    with_pathspecs(repo, &["restore", "--worktree"], &tracked)?;
+    let untracked: Vec<PathBuf> = entries
+        .iter()
+        .filter(|e| e.untracked())
+        .map(|e| repo.join(&e.path))
+        .collect();
+    if !untracked.is_empty() {
+        trash::delete_all(&untracked).map_err(|e| GitError::Other {
+            code: None,
+            stderr: format!("Could not move untracked files to the Trash: {e}"),
+        })?;
+    }
+    Ok(())
+}
+
 /// Commits the index with `message` (hooks run as usual). `amend` replaces HEAD.
 pub fn commit(repo: &Path, message: &str, amend: bool) -> Result<(), GitError> {
     let mut args = vec!["commit", "--cleanup=strip", "-F", "-"];
@@ -836,6 +859,33 @@ mod tests {
                 .contains("rename to b.txt")
         );
         assert!(file_diff(d, renamed, false).unwrap().contains("+two"));
+
+        // discard restores a tracked file to its index content (untracked → Trash isn't run in tests)
+        write("gone.txt", "edited\n");
+        git(d, &["add", "gone.txt"]);
+        write("gone.txt", "edited again\n");
+        let entry = status(d)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.path == "gone.txt")
+            .unwrap();
+        discard(d, &[entry]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join("gone.txt")).unwrap(),
+            "edited\n"
+        );
+        unstage(d, &["gone.txt"]).unwrap();
+        let entry = status(d)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.path == "gone.txt")
+            .unwrap();
+        discard(d, &[entry]).unwrap();
+        // unstaged → the index holds HEAD's version again, so discard restores that
+        assert_eq!(
+            std::fs::read_to_string(d.join("gone.txt")).unwrap(),
+            "bye\n"
+        );
 
         // amend rewrites HEAD's message without adding a commit
         commit(d, "add gone (amended)", true).unwrap();

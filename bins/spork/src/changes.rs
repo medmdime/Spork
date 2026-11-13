@@ -1,7 +1,7 @@
 //! Working copy: unstaged / staged files, per-file diff, commit box (docs/specs/M07).
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::diff::{Diff, DiffFile};
 use gpui_kit::component::input::{Input, Textarea};
@@ -106,6 +106,50 @@ impl RepoView {
             },
             |_, _, _, _| {},
         );
+    }
+
+    /// Asks before throwing away unstaged changes; untracked files go to the Trash (M07 §3).
+    fn confirm_discard(&mut self, paths: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let entries: Vec<StatusEntry> = self
+            .status_entries(false)
+            .into_iter()
+            .filter(|e| paths.contains(&e.path) && !e.conflicted)
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let untracked = entries.iter().filter(|e| e.untracked()).count();
+        let what = match entries.as_slice() {
+            [one] => one.path.clone(),
+            many => format!("{} files", many.len()),
+        };
+        let note = match untracked {
+            0 => "Unstaged changes are lost. Staged changes stay.".to_owned(),
+            n => format!("Unstaged changes are lost; {n} untracked file(s) go to the Trash."),
+        };
+        let view = cx.entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (view, entries) = (view.clone(), entries.clone());
+            dialog
+                .title(format!("Discard changes to {what}?"))
+                .description(note.clone())
+                .confirm()
+                .ok_text("Discard")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let entries = entries.clone();
+                    view.update(cx, |this, cx| {
+                        this.run_op(
+                            window,
+                            cx,
+                            move |root| spork_git::discard(root, &entries),
+                            |_, _, _, _| {},
+                        )
+                    });
+                    true
+                })
+        });
     }
 
     fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -247,6 +291,19 @@ impl RepoView {
                                     .child(dir),
                             ),
                     )
+                    .when(!staged && !entry.conflicted, |row| {
+                        let path = entry.path.clone();
+                        row.child(
+                            Button::new(SharedString::from(format!("discard-{ix}")))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Undo2)
+                                .tooltip("Discard changes…")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.confirm_discard(vec![path.clone()], window, cx)
+                                })),
+                        )
+                    })
                     .child(
                         Button::new(SharedString::from(format!("toggle-{}-{ix}", staged)))
                             .ghost()
@@ -285,14 +342,30 @@ impl RepoView {
                 if staged { "Staged" } else { "Unstaged" }
             ))
             .when(count > 0, |h| {
+                let all = paths.clone();
                 h.child(
-                    Button::new(if staged { "unstage-all" } else { "stage-all" })
-                        .ghost()
-                        .xsmall()
-                        .label(if staged { "Unstage all" } else { "Stage all" })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.toggle_stage(paths.clone(), staged, window, cx)
-                        })),
+                    h_flex()
+                        .gap_1()
+                        .when(!staged, |h| {
+                            h.child(
+                                Button::new("discard-all")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Discard all")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.confirm_discard(all.clone(), window, cx)
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new(if staged { "unstage-all" } else { "stage-all" })
+                                .ghost()
+                                .xsmall()
+                                .label(if staged { "Unstage all" } else { "Stage all" })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.toggle_stage(paths.clone(), staged, window, cx)
+                                })),
+                        ),
                 )
             });
         let list = uniform_list(
