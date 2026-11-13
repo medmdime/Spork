@@ -64,8 +64,8 @@ behaviour predictable and testable without a window. Details: [docs/00-overview.
 |---|---|---|
 | P0 Foundations | git runner, error handling, repo view with branches/remotes/tags, themes, auto-refresh, CI on 3 OSes | ✓ done |
 | **P1 Read-only client** | commit graph ✓, commit details ✓, diffs ✓, blame, file history, search | **in progress** |
-| **P2 Daily driver** | staging ✓ (line-level next), commit ✓, amend ✓, fetch/pull/push ✓, branches ✓, credentials | **in progress** |
-| P3 History editing | merge, rebase, interactive rebase, conflict resolver, cherry-pick, stash, tags | |
+| P2 Daily driver | staging incl. single lines ✓, discard ✓, commit ✓, amend ✓, fetch/pull/push ✓, branches ✓, password prompts ✓ | ✓ done |
+| **P3 History editing** | merge, rebase, interactive rebase, conflict resolver, cherry-pick, stash, tags | **next** |
 | P4 Breadth | clone, submodules, worktrees, git-flow, LFS, image diffs, workspaces | |
 | P5 Integrations | hosting accounts & pull requests, custom commands, statistics | |
 | P6 AI | the optional AI features above | |
@@ -95,6 +95,7 @@ cargo test --workspace
 ```
 crates/spork-git   git runner, error classification, refs and commit log (tested against real git)
 crates/spork-graph commit-graph lane layout (pure, no I/O)
+crates/spork-patch partial patches for line-level staging (pure, no I/O)
 bins/spork         the desktop app (GPUI Kit), themes in bins/spork/assets/themes
 docs/              architecture overview, 16 feature specs, AI and open-source policy
 scripts/           helpers for writing behaviour specs
