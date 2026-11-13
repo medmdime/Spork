@@ -690,6 +690,54 @@ pub fn stash_drop(repo: &Path, index: usize) -> Result<(), GitError> {
     run(repo, &["stash", "drop", &format!("stash@{{{index}}}")]).map(drop)
 }
 
+/// Creates tag `name` at `target`; annotated when `message` isn't empty (docs/specs/M12 §2).
+pub fn create_tag(repo: &Path, name: &str, target: &str, message: &str) -> Result<(), GitError> {
+    if run(repo, &["check-ref-format", &format!("refs/tags/{name}")]).is_err() {
+        return Err(GitError::Other {
+            code: None,
+            stderr: format!("`{name}` is not a valid tag name."),
+        });
+    }
+    if message.trim().is_empty() {
+        run(repo, &["tag", name, target]).map(drop)
+    } else {
+        run(
+            repo,
+            &[
+                "tag",
+                "--annotate",
+                name,
+                "--message",
+                message.trim(),
+                target,
+            ],
+        )
+        .map(drop)
+    }
+}
+
+pub fn delete_tag(repo: &Path, name: &str) -> Result<(), GitError> {
+    run(repo, &["tag", "--delete", name]).map(drop)
+}
+
+/// Pushes one tag to `origin` (or the only remote). Returns the remote's name.
+pub fn push_tag(repo: &Path, name: &str) -> Result<String, GitError> {
+    let remotes = String::from_utf8_lossy(&run(repo, &["remote"])?).into_owned();
+    let remotes: Vec<&str> = remotes.lines().collect();
+    let remote = match remotes[..] {
+        _ if remotes.contains(&"origin") => "origin",
+        [only] => only,
+        _ => {
+            return Err(GitError::Other {
+                code: None,
+                stderr: "No `origin` remote to push the tag to.".into(),
+            });
+        }
+    };
+    run(repo, &["push", remote, &format!("refs/tags/{name}")])?;
+    Ok(remote.to_owned())
+}
+
 /// Where a partial patch from `spork-patch` is applied (docs/specs/M07 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchTarget {
@@ -1680,6 +1728,65 @@ mod tests {
         assert_eq!(stashes(d).unwrap().len(), 1);
         stash_drop(d, 0).unwrap();
         assert!(stashes(d).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tags_create_delete_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (server, d) = (tmp.path().join("server.git"), tmp.path().join("repo"));
+        git(
+            tmp.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                server.to_str().unwrap(),
+            ],
+        );
+        git(
+            tmp.path(),
+            &["init", "-q", "-b", "main", d.to_str().unwrap()],
+        );
+        git(&d, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&d, &["commit", "-q", "--allow-empty", "-m", "two"]);
+
+        create_tag(&d, "v1.0", "HEAD~1", "").unwrap();
+        create_tag(&d, "v2.0", "HEAD", "Second release").unwrap();
+        assert!(
+            create_tag(&d, "bad tag", "HEAD", "")
+                .unwrap_err()
+                .to_string()
+                .contains("not a valid")
+        );
+        let tags: Vec<Ref> = refs(&d)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == RefKind::Tag)
+            .collect();
+        let v1 = tags.iter().find(|t| t.name == "v1.0").unwrap();
+        let v2 = tags.iter().find(|t| t.name == "v2.0").unwrap();
+        assert_eq!(v1.target, v1.commit); // lightweight
+        assert_ne!(v2.target, v2.commit); // annotated: a tag object
+        assert_eq!(v2.commit, log(&d, 1).unwrap()[0].id);
+
+        assert!(push_tag(&d, "v2.0").is_err()); // no remote yet
+        git(&d, &["remote", "add", "origin", server.to_str().unwrap()]);
+        assert_eq!(push_tag(&d, "v2.0").unwrap(), "origin");
+        assert!(
+            !String::from_utf8(run(&server, &["tag"]).unwrap())
+                .unwrap()
+                .contains("v1.0")
+        );
+        assert!(
+            String::from_utf8(run(&server, &["tag"]).unwrap())
+                .unwrap()
+                .contains("v2.0")
+        );
+
+        delete_tag(&d, "v1.0").unwrap();
+        assert!(!refs(&d).unwrap().iter().any(|r| r.name == "v1.0"));
     }
 
     #[test]

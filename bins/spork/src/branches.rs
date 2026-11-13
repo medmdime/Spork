@@ -18,6 +18,8 @@ enum Action {
     Delete,
     Merge,
     Rebase,
+    PushTag,
+    DeleteTag,
 }
 
 /// Right-click menu for a branch, remote branch or tag in the sidebar.
@@ -65,7 +67,11 @@ pub fn ref_menu(
                     &format!("Rebase current branch onto {name}"),
                     Action::Rebase,
                 )),
-            RefKind::Tag => menu.item(item("New branch from here…", Action::NewBranchFrom)),
+            RefKind::Tag => menu
+                .item(item("New branch from here…", Action::NewBranchFrom))
+                .item(item("Push tag to origin", Action::PushTag))
+                .item(PopupMenuItem::separator())
+                .item(item("Delete tag…", Action::DeleteTag)),
         }
     }
 }
@@ -98,6 +104,43 @@ impl RepoView {
                 notify_success,
             ),
             Action::NewBranchFrom => self.new_branch_dialog(name, window, cx),
+            Action::PushTag => self.run_op(
+                window,
+                cx,
+                move |root| {
+                    spork_git::push_tag(root, &name)
+                        .map(|remote| format!("Pushed {name} to {remote}"))
+                },
+                notify_success,
+            ),
+            Action::DeleteTag => {
+                window.open_alert_dialog(cx, move |dialog, _, _| {
+                    let (view, tag) = (view.clone(), name.clone());
+                    dialog
+                        .title(format!("Delete tag {tag}?"))
+                        .description(
+                            "Only the local tag is deleted; a pushed tag stays on the remote.",
+                        )
+                        .confirm()
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger)
+                        .on_ok(move |_, window, cx| {
+                            let tag = tag.clone();
+                            view.update(cx, |this, cx| {
+                                this.run_op(
+                                    window,
+                                    cx,
+                                    move |root| {
+                                        spork_git::delete_tag(root, &tag)
+                                            .map(|()| format!("Deleted tag {tag}"))
+                                    },
+                                    notify_success,
+                                )
+                            });
+                            true
+                        })
+                });
+            }
             Action::Merge => self.run_outcome(window, cx, format!("Merged {name}"), move |root| {
                 spork_git::merge(root, &name)
             }),

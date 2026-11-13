@@ -63,6 +63,8 @@ struct RepoView {
     /// "Stash changes" dialog state (operations.rs).
     stash_message: Entity<InputState>,
     stash_untracked: bool,
+    tag_name: Entity<InputState>,
+    tag_message: Entity<InputState>,
     _prompts: Option<Task<()>>,
     description: Entity<TextareaState>,
     amend: bool,
@@ -126,6 +128,8 @@ impl RepoView {
             stash_message: cx
                 .new(|cx| InputState::new(window, cx).placeholder("Message (optional)")),
             stash_untracked: true,
+            tag_name: cx.new(|cx| InputState::new(window, cx).placeholder("v1.2.0")),
+            tag_message: cx.new(|cx| InputState::new(window, cx).placeholder("Message (optional)")),
             _prompts: prompts.map(|rx| {
                 cx.spawn_in(window, async move |this, cx| {
                     while let Ok((prompt, reply)) = rx.recv().await {

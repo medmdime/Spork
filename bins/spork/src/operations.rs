@@ -219,6 +219,9 @@ impl RepoView {
             .item(item("New branch here…", |this, id, window, cx| {
                 this.new_branch_dialog(id, window, cx)
             }))
+            .item(item("Create tag here…", |this, id, window, cx| {
+                this.tag_dialog(id, window, cx)
+            }))
             .item(item(&format!("Copy SHA ({short})"), |_, id, window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(id));
                 window.push_notification(Notification::info("Commit SHA copied"), cx);
@@ -335,6 +338,60 @@ impl RepoView {
                             |_, _, window, cx| {
                                 window
                                     .push_notification(Notification::success("Changes stashed"), cx)
+                            },
+                        )
+                    });
+                    true
+                })
+        });
+    }
+
+    /// "Create tag" dialog at `target`: name, optional message (annotated when given).
+    pub(crate) fn tag_dialog(
+        &mut self,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tag_name
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.tag_message
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        let (view, name, message) = (cx.entity(), self.tag_name.clone(), self.tag_message.clone());
+        let short: String = target.chars().take(7).collect();
+        let muted = cx.theme().muted_foreground;
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (view, name, message, target) =
+                (view.clone(), name.clone(), message.clone(), target.clone());
+            dialog
+                .title("Create tag")
+                .description(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().text_color(muted).child(format!(
+                            "On commit {short}. A message makes it an annotated tag."
+                        )))
+                        .child(Input::new(&name))
+                        .child(Input::new(&message)),
+                )
+                .confirm()
+                .ok_text("Create tag")
+                .on_ok(move |_, window, cx| {
+                    let (tag, text, target) = (
+                        name.read(cx).value().trim().to_owned(),
+                        message.read(cx).value().to_string(),
+                        target.clone(),
+                    );
+                    view.update(cx, |this, cx| {
+                        this.run_op(
+                            window,
+                            cx,
+                            move |root| {
+                                spork_git::create_tag(root, &tag, &target, &text)
+                                    .map(|()| format!("Created tag {tag}"))
+                            },
+                            |_, msg, window, cx| {
+                                window.push_notification(Notification::success(msg), cx)
                             },
                         )
                     });
