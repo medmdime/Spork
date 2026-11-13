@@ -20,6 +20,7 @@ enum Action {
     Rebase,
     PushTag,
     DeleteTag,
+    Worktree,
 }
 
 /// Right-click menu for a branch, remote branch or tag in the sidebar.
@@ -41,6 +42,7 @@ pub fn ref_menu(
             RefKind::Local => menu
                 .item(item("Checkout", Action::Checkout).disabled(is_head))
                 .item(item("New branch from here…", Action::NewBranchFrom))
+                .item(item("Check out in new worktree…", Action::Worktree).disabled(is_head))
                 .item(PopupMenuItem::separator())
                 .item(
                     item(&format!("Merge {name} into current branch"), Action::Merge)
@@ -104,6 +106,7 @@ impl RepoView {
                 notify_success,
             ),
             Action::NewBranchFrom => self.new_branch_dialog(name, window, cx),
+            Action::Worktree => self.new_worktree_dialog(name, window, cx),
             Action::PushTag => self.run_op(
                 window,
                 cx,

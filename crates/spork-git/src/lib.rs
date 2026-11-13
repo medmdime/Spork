@@ -877,6 +877,75 @@ pub fn init(path: &Path) -> Result<(), GitError> {
     run(path, args).map(drop)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    /// Checked-out branch (short name); `None` when detached.
+    pub branch: Option<String>,
+    /// The repository's main working tree (can't be removed).
+    pub is_main: bool,
+}
+
+/// All working trees of the repository, main one first (docs/specs/M12 §4).
+pub fn worktrees(repo: &Path) -> Result<Vec<Worktree>, GitError> {
+    let out = run(repo, &["worktree", "list", "--porcelain", "-z"])?;
+    let mut list: Vec<Worktree> = Vec::new();
+    for field in String::from_utf8_lossy(&out).split('\0') {
+        if let Some(path) = field.strip_prefix("worktree ") {
+            list.push(Worktree {
+                path: PathBuf::from(path),
+                branch: None,
+                is_main: list.is_empty(),
+            });
+        } else if let (Some(branch), Some(w)) = (field.strip_prefix("branch "), list.last_mut()) {
+            w.branch = Some(branch.trim_start_matches("refs/heads/").to_owned());
+        }
+    }
+    Ok(list)
+}
+
+/// Checks out an existing local `branch` in a new working tree at `path`.
+pub fn add_worktree(repo: &Path, path: &Path, branch: &str) -> Result<(), GitError> {
+    run(repo, &["worktree", "add", &path.to_string_lossy(), branch]).map(drop)
+}
+
+/// Removes a working tree; git refuses if it has uncommitted changes.
+pub fn remove_worktree(repo: &Path, path: &Path) -> Result<(), GitError> {
+    run(repo, &["worktree", "remove", &path.to_string_lossy()]).map(drop)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submodule {
+    pub path: String,
+    pub commit: String,
+    /// `' '` up to date, `'-'` not initialized, `'+'` different commit checked out, `'U'` conflict.
+    pub state: char,
+}
+
+/// Submodules, recursively (M12 §3).
+pub fn submodules(repo: &Path) -> Result<Vec<Submodule>, GitError> {
+    let out = run(repo, &["submodule", "status", "--recursive"])?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let state = line.chars().next()?;
+            let mut f = line[state.len_utf8()..].split(' ');
+            let commit = f.next()?.to_owned();
+            let path = f.next()?.to_owned();
+            Some(Submodule {
+                path,
+                commit,
+                state,
+            })
+        })
+        .collect())
+}
+
+/// Initializes and checks out every submodule at the commit the repository records.
+pub fn update_submodules(repo: &Path) -> Result<(), GitError> {
+    run(repo, &["submodule", "update", "--init", "--recursive"]).map(drop)
+}
+
 /// Where a partial patch from `spork-patch` is applied (docs/specs/M07 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchTarget {
@@ -2017,6 +2086,50 @@ mod tests {
         // never clone over an existing non-empty folder
         let err = clone(origin.to_str().unwrap(), tmp.path(), "copy").unwrap_err();
         assert!(err.to_string().contains("isn't empty"));
+    }
+
+    #[test]
+    fn worktrees_and_submodules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (lib, d) = (tmp.path().join("lib"), tmp.path().join("app"));
+        init(&lib).unwrap();
+        git(&lib, &["commit", "-q", "--allow-empty", "-m", "lib"]);
+        init(&d).unwrap();
+        git(&d, &["commit", "-q", "--allow-empty", "-m", "app"]);
+        git(&d, &["branch", "feature"]);
+
+        let wt = tmp.path().join("app-feature");
+        add_worktree(&d, &wt, "feature").unwrap();
+        let list = worktrees(&d).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].is_main && !list[1].is_main);
+        assert_eq!(list[1].branch.as_deref(), Some("feature"));
+        assert_eq!(head_branch(&wt).unwrap().as_deref(), Some("feature"));
+        std::fs::write(wt.join("dirty.txt"), "x").unwrap();
+        assert!(remove_worktree(&d, &wt).is_err()); // uncommitted work is protected
+        std::fs::remove_file(wt.join("dirty.txt")).unwrap();
+        remove_worktree(&d, &wt).unwrap();
+        assert_eq!(worktrees(&d).unwrap().len(), 1);
+
+        assert!(submodules(&d).unwrap().is_empty());
+        git(
+            &d,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                lib.to_str().unwrap(),
+                "vendor/lib",
+            ],
+        );
+        git(&d, &["commit", "-q", "-m", "add lib"]);
+        let subs = submodules(&d).unwrap();
+        assert_eq!(
+            (subs.len(), subs[0].path.as_str(), subs[0].state),
+            (1, "vendor/lib", ' ')
+        );
     }
 
     #[test]

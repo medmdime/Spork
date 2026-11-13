@@ -66,7 +66,7 @@ behaviour predictable and testable without a window. Details: [docs/00-overview.
 | **P1 Read-only client** | commit graph ✓, commit details ✓, diffs ✓, blame, file history, search | **in progress** |
 | P2 Daily driver | staging incl. single lines ✓, discard ✓, commit ✓, amend ✓, fetch/pull/push ✓, branches ✓, password prompts ✓ | ✓ done |
 | P3 History editing | merge ✓, rebase ✓, interactive rebase ✓, 3-way conflict resolver ✓, cherry-pick ✓, revert ✓, stashes ✓, tags ✓ | ✓ done |
-| **P4 Breadth** | clone, submodules, worktrees, git-flow, LFS, image diffs, workspaces | **next** |
+| **P4 Breadth** | open / clone / new ✓, recent repos ✓, submodules ✓, worktrees ✓, git-flow, LFS, image diffs | **in progress** |
 | P5 Integrations | hosting accounts & pull requests, custom commands, statistics | |
 | P6 AI | the optional AI features above | |
 | P7 1.0 | installers for every OS, auto-update, docs site | |

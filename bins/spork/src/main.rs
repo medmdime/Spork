@@ -7,6 +7,7 @@ mod history;
 mod operations;
 mod rebase;
 mod repos;
+mod worktrees;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +27,9 @@ use gpui_kit::component::{resizable_panel, v_resizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use history::{History, ROW_HEIGHT};
-use spork_git::{CommitDetails, GitError, OpState, Ref, RefKind, Stash, StatusEntry};
+use spork_git::{
+    CommitDetails, GitError, OpState, Ref, RefKind, Stash, StatusEntry, Submodule, Worktree,
+};
 
 // shortcut: fixed cap until the history loads incrementally (M05 §1 batches), then it becomes a setting.
 const MAX_COMMITS: usize = 50_000;
@@ -89,6 +92,8 @@ struct Loaded {
     status: Vec<StatusEntry>,
     op: OpState,
     stashes: Vec<Stash>,
+    worktrees: Vec<Worktree>,
+    submodules: Vec<Submodule>,
     history: History,
 }
 
@@ -321,6 +326,8 @@ fn load(path: &Path) -> Result<Loaded, GitError> {
     let status = spork_git::status(&root)?;
     let op = spork_git::op_state(&root)?;
     let stashes = spork_git::stashes(&root)?;
+    let worktrees = spork_git::worktrees(&root)?;
+    let submodules = spork_git::submodules(&root)?;
     let history = History::new(spork_git::log(&root, MAX_COMMITS)?, &refs);
     Ok(Loaded {
         head: spork_git::head_branch(&root)?,
@@ -328,6 +335,8 @@ fn load(path: &Path) -> Result<Loaded, GitError> {
         status,
         op,
         stashes,
+        worktrees,
+        submodules,
         history,
         root,
     })
@@ -438,6 +447,8 @@ impl RepoView {
                 .collect::<Vec<_>>()
         };
         let stash_items = self.stash_items(&repo.stashes, cx);
+        let worktree_items = self.worktree_items(&repo.worktrees, cx);
+        let submodule_items = self.submodule_items(&repo.submodules, cx);
         let view = cx.entity();
         let locals = of(RefKind::Local);
         let remotes = of(RefKind::Remote);
@@ -508,6 +519,18 @@ impl RepoView {
                     ),
                     section("Tags", tags.len(), IconName::Tag, tags),
                     section("Stashes", stash_items.len(), IconName::Archive, stash_items),
+                    section(
+                        "Worktrees",
+                        worktree_items.len(),
+                        IconName::FolderGit2,
+                        worktree_items,
+                    ),
+                    section(
+                        "Submodules",
+                        submodule_items.len(),
+                        IconName::Package,
+                        submodule_items,
+                    ),
                 ]),
             );
 
