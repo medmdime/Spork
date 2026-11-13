@@ -809,10 +809,6 @@ mod tests {
             tmp.path(),
             &["init", "-q", "-b", "main", a.to_str().unwrap()],
         );
-        for d in [&a] {
-            git(d, &["config", "user.name", "Spork Test"]);
-            git(d, &["config", "user.email", "test@spork.invalid"]);
-        }
         git(&a, &["commit", "-q", "--allow-empty", "-m", "one"]);
 
         // no remote yet: a clear error instead of a git usage message

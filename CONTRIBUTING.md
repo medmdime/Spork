@@ -34,8 +34,10 @@ pull requests only, no force pushes. Until then, rules 3–5 already apply to ev
 
 ## Getting started
 
+Run exactly what CI runs (format, lint, all tests) before every push:
+
 ```bash
-cargo test --workspace
+./scripts/check.sh
 ```
 
 ```bash
