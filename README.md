@@ -115,7 +115,8 @@ More in [docs/20-open-source.md](docs/20-open-source.md).
 
 ## License
 
-Spork is free software, and the plan is **GPL-3.0-or-later**: anyone can use, study, change and share it, and
-every distributed version must stay open source too. The license file is added before the first release.
+Spork is free software, licensed under the **[GNU General Public License v3.0 or later](LICENSE)**.
+Anyone can use, study, change and share it, and every distributed version, including modified ones, must stay
+open source under the same terms. That's how Spork stays open for everyone, for good.
 
 *Spork is not affiliated with or endorsed by Fork, GitKraken, or any other Git client. Product names belong to their owners.*
