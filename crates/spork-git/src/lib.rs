@@ -514,6 +514,56 @@ fn run_allowing_diff(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     }
 }
 
+/// Fetches every remote, pruning remote branches deleted upstream (docs/specs/M09 §1).
+pub fn fetch(repo: &Path) -> Result<(), GitError> {
+    run(repo, &["fetch", "--all", "--prune"]).map(drop)
+}
+
+/// Pulls the current branch's upstream; merge vs rebase follows the user's git config. Never opens an editor.
+pub fn pull(repo: &Path) -> Result<(), GitError> {
+    run(repo, &["pull", "--no-edit"]).map(drop)
+}
+
+/// Pushes the current branch. The first push sets the upstream on `origin` (or the only remote).
+/// Returns a short summary for the notification.
+pub fn push(repo: &Path) -> Result<String, GitError> {
+    let fail = |msg: &str| GitError::Other {
+        code: None,
+        stderr: msg.to_owned(),
+    };
+    let branch = head_branch(repo)?
+        .ok_or_else(|| fail("HEAD is detached: check out a branch to push it."))?;
+    if run(
+        repo,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .is_ok()
+    {
+        run(repo, &["push"])?;
+        return Ok(format!("Pushed {branch}"));
+    }
+    let remotes = String::from_utf8_lossy(&run(repo, &["remote"])?).into_owned();
+    let remotes: Vec<&str> = remotes.lines().collect();
+    let remote = match remotes[..] {
+        _ if remotes.contains(&"origin") => "origin",
+        [only] => only,
+        [] => return Err(fail("This repository has no remote to push to.")),
+        _ => {
+            return Err(fail(
+                "Several remotes and none is `origin`: set an upstream for this branch first.",
+            ));
+        }
+    };
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    run(repo, &["push", "--set-upstream", remote, &refspec])?;
+    Ok(format!("Pushed {branch} to {remote}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +784,80 @@ mod tests {
         commit(d, "add gone (amended)", true).unwrap();
         assert_eq!(head_message(d).as_deref(), Some("add gone (amended)"));
         assert_eq!(log(d, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn fetch_pull_push_against_a_bare_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (server, a, b) = (
+            tmp.path().join("server.git"),
+            tmp.path().join("a"),
+            tmp.path().join("b"),
+        );
+        git(
+            tmp.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                server.to_str().unwrap(),
+            ],
+        );
+        git(
+            tmp.path(),
+            &["init", "-q", "-b", "main", a.to_str().unwrap()],
+        );
+        for d in [&a] {
+            git(d, &["config", "user.name", "Spork Test"]);
+            git(d, &["config", "user.email", "test@spork.invalid"]);
+        }
+        git(&a, &["commit", "-q", "--allow-empty", "-m", "one"]);
+
+        // no remote yet: a clear error instead of a git usage message
+        assert!(push(&a).unwrap_err().to_string().contains("no remote"));
+        git(&a, &["remote", "add", "origin", server.to_str().unwrap()]);
+        // first push sets the upstream
+        assert_eq!(push(&a).unwrap(), "Pushed main to origin");
+        assert_eq!(
+            refs(&a)
+                .unwrap()
+                .iter()
+                .find(|r| r.name == "main")
+                .unwrap()
+                .upstream
+                .as_deref(),
+            Some("origin/main")
+        );
+
+        // someone else pushes a commit
+        git(
+            tmp.path(),
+            &["clone", "-q", server.to_str().unwrap(), b.to_str().unwrap()],
+        );
+        git(&b, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        assert_eq!(push(&b).unwrap(), "Pushed main");
+
+        // fetch shows we're behind, pull fast-forwards
+        fetch(&a).unwrap();
+        assert_eq!(
+            refs(&a)
+                .unwrap()
+                .iter()
+                .find(|r| r.name == "main")
+                .unwrap()
+                .behind,
+            1
+        );
+        pull(&a).unwrap();
+        assert_eq!(head_message(&a).as_deref(), Some("two"));
+
+        // diverged: push is rejected with the friendly error
+        git(&b, &["commit", "-q", "--allow-empty", "-m", "three"]);
+        push(&b).unwrap();
+        git(&a, &["commit", "-q", "--allow-empty", "-m", "local"]);
+        assert_eq!(push(&a).unwrap_err(), GitError::NonFastForward);
     }
 
     #[test]

@@ -12,8 +12,10 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
 use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, WindowExt as _};
 use gpui_kit::component::{resizable_panel, v_resizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -202,6 +204,45 @@ impl RepoView {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RemoteOp {
+    Fetch,
+    Pull,
+    Push,
+}
+
+impl RepoView {
+    /// Fetch / Pull / Push in the background; the outcome is a notification (docs/specs/M09).
+    fn remote_op(&mut self, op: RemoteOp, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_op(
+            window,
+            cx,
+            move |root| match op {
+                RemoteOp::Fetch => {
+                    spork_git::fetch(root).map(|()| "Fetched all remotes".to_owned())
+                }
+                RemoteOp::Pull => spork_git::pull(root).map(|()| "Pulled".to_owned()),
+                RemoteOp::Push => spork_git::push(root),
+            },
+            |_, message, window, cx| window.push_notification(Notification::success(message), cx),
+        );
+    }
+
+    fn remote_button(&self, op: RemoteOp, cx: &mut Context<Self>) -> Button {
+        let (id, icon, tip) = match op {
+            RemoteOp::Fetch => ("fetch", IconName::CloudDownload, "Fetch all remotes"),
+            RemoteOp::Pull => ("pull", IconName::ArrowDown, "Pull"),
+            RemoteOp::Push => ("push", IconName::ArrowUp, "Push"),
+        };
+        Button::new(id)
+            .ghost()
+            .icon(icon)
+            .tooltip(tip)
+            .disabled(self.busy)
+            .on_click(cx.listener(move |this, _, window, cx| this.remote_op(op, window, cx)))
+    }
+}
+
 const MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
 
 fn load(path: &Path) -> Result<Loaded, GitError> {
@@ -356,11 +397,10 @@ impl RepoView {
                             .child(div().text_xs().child(head)),
                     )
                     .child(
-                        Button::new("refresh")
-                            .ghost()
-                            .icon(IconName::RefreshCw)
-                            .tooltip("Refresh")
-                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                        h_flex()
+                            .child(self.remote_button(RemoteOp::Fetch, cx))
+                            .child(self.remote_button(RemoteOp::Pull, cx))
+                            .child(self.remote_button(RemoteOp::Push, cx)),
                     ),
             )
             .child(

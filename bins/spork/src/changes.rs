@@ -61,12 +61,12 @@ impl RepoView {
     }
 
     /// Runs a git write in the background, then reloads; failures become a notification.
-    fn run_op(
+    pub(crate) fn run_op<T: Send + 'static>(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-        op: impl FnOnce(&std::path::Path) -> Result<(), GitError> + Send + 'static,
-        on_success: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        op: impl FnOnce(&std::path::Path) -> Result<T, GitError> + Send + 'static,
+        on_success: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
     ) {
         let Some(Ok(repo)) = &self.repo else { return };
         let root = repo.root.clone();
@@ -77,7 +77,7 @@ impl RepoView {
             this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match result {
-                    Ok(()) => on_success(this, window, cx),
+                    Ok(value) => on_success(this, value, window, cx),
                     Err(e) => window.push_notification(Notification::error(e.to_string()), cx),
                 }
                 this.reload(cx);
@@ -104,7 +104,7 @@ impl RepoView {
                     spork_git::stage(root, &paths)
                 }
             },
-            |_, _, _| {},
+            |_, _, _, _| {},
         );
     }
 
@@ -125,7 +125,7 @@ impl RepoView {
             window,
             cx,
             move |root| spork_git::commit(root, &message, amend),
-            |this, window, cx| {
+            |this, _, window, cx| {
                 this.subject.update(cx, |s, cx| s.set_value("", window, cx));
                 this.description
                     .update(cx, |s, cx| s.set_value("", window, cx));
