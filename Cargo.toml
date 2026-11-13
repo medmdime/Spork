@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/spork-git", "bins/spork"]
+members = ["crates/spork-git", "crates/spork-graph", "bins/spork"]
 
 [workspace.package]
 version = "0.0.1"

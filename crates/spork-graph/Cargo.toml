@@ -1,0 +1,7 @@
+[package]
+name = "spork-graph"
+description = "Commit graph lane layout for Spork (pure, no I/O)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true

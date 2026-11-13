@@ -5948,6 +5948,7 @@ version = "0.0.1"
 dependencies = [
  "gpui-kit",
  "spork-git",
+ "spork-graph",
 ]
 
 [[package]]
@@ -5956,6 +5957,10 @@ version = "0.0.1"
 dependencies = [
  "tempfile",
 ]
+
+[[package]]
+name = "spork-graph"
+version = "0.0.1"
 
 [[package]]
 name = "stable_deref_trait"

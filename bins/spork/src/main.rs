@@ -1,18 +1,29 @@
-//! Spork desktop app. P0: open a repository and show its branches, remotes and tags (docs/specs/M01, M03).
+//! Spork desktop app. P1: repository sidebar (docs/specs/M03) and commit list with graph (M05).
+
+mod history;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, TitleBar, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use history::{History, ROW_HEIGHT};
 use spork_git::{GitError, Ref, RefKind};
+
+// shortcut: fixed cap until the history loads incrementally (M05 §1 batches), then it becomes a setting.
+const MAX_COMMITS: usize = 50_000;
 
 struct RepoView {
     requested: PathBuf,
-    repo: Result<Loaded, GitError>,
+    /// `None` until the first load finishes.
+    repo: Option<Result<Loaded, GitError>>,
+    selected: Option<usize>,
+    _load: Option<Task<()>>,
     _appearance: Subscription,
 }
 
@@ -20,6 +31,7 @@ struct Loaded {
     root: PathBuf,
     head: Option<String>,
     refs: Vec<Ref>,
+    history: History,
 }
 
 impl RepoView {
@@ -28,26 +40,39 @@ impl RepoView {
         let _appearance = cx.observe_window_appearance(window, |_, window, cx| {
             Theme::sync_system_appearance(Some(window), cx)
         });
-        let repo = load(&requested);
-        Self {
+        let mut view = Self {
             requested,
-            repo,
+            repo: None,
+            selected: None,
+            _load: None,
             _appearance,
-        }
+        };
+        view.reload(cx);
+        view
     }
 
+    /// Reads the repository on a background thread; the current view stays until the new data is in.
     fn reload(&mut self, cx: &mut Context<Self>) {
-        self.repo = load(&self.requested);
-        cx.notify();
+        let path = self.requested.clone();
+        self._load = Some(cx.spawn(async move |this, cx| {
+            let loaded = cx.background_spawn(async move { load(&path) }).await;
+            this.update(cx, |this, cx| {
+                this.repo = Some(loaded);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 }
 
-// shortcut: reads on the UI thread; fine for P0 ref counts, moves to the background executor with the watcher (P0 wk 2).
 fn load(path: &Path) -> Result<Loaded, GitError> {
     let root = spork_git::toplevel(path)?;
+    let refs = spork_git::refs(&root)?;
+    let history = History::new(spork_git::log(&root, MAX_COMMITS)?, &refs);
     Ok(Loaded {
         head: spork_git::head_branch(&root)?,
-        refs: spork_git::refs(&root)?,
+        refs,
+        history,
         root,
     })
 }
@@ -129,10 +154,18 @@ impl Render for RepoView {
 impl RepoView {
     fn body(&mut self, cx: &mut Context<Self>) -> Div {
         let base = h_flex().w_full();
+        let centered = |msg: String| {
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(div().text_sm().child(msg))
+        };
 
         let repo = match &self.repo {
-            Ok(repo) => repo,
-            Err(e) => {
+            None => return base.child(centered("Loading repository…".into())),
+            Some(Ok(repo)) => repo,
+            Some(Err(e)) => {
                 return base.justify_center().child(
                     v_flex()
                         .gap_3()
@@ -205,32 +238,108 @@ impl RepoView {
                 section("Tags", tags.len(), IconName::Tag, tags),
             ]));
 
+        let count = repo.history.commits.len();
+        let lanes = repo.history.graph_lanes;
         let theme = cx.theme();
-        base.child(sidebar).child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .mr_2()
-                .mb_2()
-                .bg(theme.background)
-                .rounded(theme.radius)
-                .px_8()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .child(
-                    div()
-                        .max_w_full()
-                        .truncate()
-                        .text_sm()
-                        .child(repo.root.display().to_string()),
+        let panel = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .mr_2()
+            .mb_2()
+            .bg(theme.background)
+            .rounded(theme.radius)
+            .overflow_hidden();
+
+        let panel = if count == 0 {
+            panel.child(centered("No commits yet".into()))
+        } else {
+            panel.child(history::header(lanes, cx)).child(
+                uniform_list(
+                    "history",
+                    count,
+                    cx.processor(|this, range, _, cx| this.history_rows(range, cx)),
                 )
-                .child(div().text_sm().child(format!(
-                    "{} branches · commit graph arrives in P1",
-                    locals.len()
-                ))),
-        )
+                .flex_1()
+                .min_h_0(),
+            )
+        };
+        base.child(sidebar).child(panel)
+    }
+
+    fn history_rows(
+        &mut self,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Stateful<Div>> {
+        let Some(Ok(repo)) = &self.repo else {
+            return Vec::new();
+        };
+        let h = &repo.history;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let theme = cx.theme();
+        let (muted, hover, active) = (theme.muted_foreground, theme.list_hover, theme.list_active);
+        let mono = theme.mono_font_family.clone();
+
+        range
+            .map(|ix| {
+                let commit = &h.commits[ix];
+                let labels = h.labels.get(&commit.id).into_iter().flatten();
+                h_flex()
+                    .id(ix)
+                    .w_full()
+                    .h(px(ROW_HEIGHT))
+                    .px_3()
+                    .gap_3()
+                    .text_sm()
+                    .when(self.selected == Some(ix), |row| row.bg(active))
+                    .hover(move |row| row.bg(hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = Some(ix);
+                        cx.notify();
+                    }))
+                    .child(history::graph_cell(
+                        &h.rows[ix],
+                        commit.parents.len() > 1,
+                        h.graph_lanes,
+                        cx,
+                    ))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1p5()
+                            .children(labels.map(|l| history::label_badge(l, cx)))
+                            .child(div().min_w_0().truncate().child(commit.subject.clone())),
+                    )
+                    .child(
+                        div()
+                            .w(px(150.))
+                            .flex_none()
+                            .truncate()
+                            .text_color(muted)
+                            .child(commit.author.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(50.))
+                            .flex_none()
+                            .text_color(muted)
+                            .child(history::relative_age(commit.time, now)),
+                    )
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .flex_none()
+                            .font_family(mono.clone())
+                            .text_xs()
+                            .text_color(muted)
+                            .child(commit.id.chars().take(7).collect::<String>()),
+                    )
+            })
+            .collect()
     }
 }
 

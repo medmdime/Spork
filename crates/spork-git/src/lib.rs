@@ -128,6 +128,8 @@ pub struct Ref {
     /// Display name, e.g. `origin/main`.
     pub name: String,
     pub target: String,
+    /// Commit the ref points at (annotated tags peeled to their commit).
+    pub commit: String,
     pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
@@ -136,7 +138,7 @@ pub struct Ref {
     pub is_head: bool,
 }
 
-const REF_FORMAT: &str = "--format=%(refname)%00%(objectname)%00%(upstream:short)%00%(upstream:track,nobracket)%00%(HEAD)";
+const REF_FORMAT: &str = "--format=%(refname)%00%(objectname)%00%(upstream:short)%00%(upstream:track,nobracket)%00%(HEAD)%00%(*objectname)";
 
 pub fn refs(repo: &Path) -> Result<Vec<Ref>, GitError> {
     let out = run(
@@ -162,6 +164,7 @@ pub fn parse_refs(out: &str) -> Vec<Ref> {
             let upstream = f.next().unwrap_or("");
             let track = f.next().unwrap_or("");
             let head = f.next().unwrap_or("");
+            let peeled = f.next().unwrap_or("");
             let (kind, name) = if let Some(n) = full.strip_prefix("refs/heads/") {
                 (RefKind::Local, n)
             } else if let Some(n) = full.strip_prefix("refs/remotes/") {
@@ -179,6 +182,7 @@ pub fn parse_refs(out: &str) -> Vec<Ref> {
                 full: full.to_owned(),
                 name: name.to_owned(),
                 target: target.to_owned(),
+                commit: if peeled.is_empty() { target } else { peeled }.to_owned(),
                 upstream: (!upstream.is_empty()).then(|| upstream.to_owned()),
                 ahead,
                 behind,
@@ -203,6 +207,60 @@ fn parse_track(track: &str) -> (u32, u32, bool) {
         }
     }
     (ahead, behind, false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub id: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    pub email: String,
+    /// Author time, Unix seconds.
+    pub time: i64,
+    pub subject: String,
+}
+
+const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s";
+
+/// Commits reachable from branches, remote branches, tags and HEAD, newest first (date order), at most `max`.
+// shortcut: CLI log; moves to an incremental gix revwalk when repos beyond ~1M commits matter (M05 §1).
+pub fn log(repo: &Path, max: usize) -> Result<Vec<Commit>, GitError> {
+    let max = format!("--max-count={max}");
+    let args = [
+        "log",
+        "-z",
+        "--date-order",
+        "--ignore-missing",
+        &max,
+        LOG_FORMAT,
+    ];
+    // HEAD may not exist yet (new repo); --ignore-missing skips it instead of failing
+    let out = run(
+        repo,
+        &[
+            &args[..],
+            &["--branches", "--remotes", "--tags", "HEAD", "--"],
+        ]
+        .concat(),
+    )?;
+    Ok(parse_log(&String::from_utf8_lossy(&out)))
+}
+
+/// Parse `git log -z` output produced with `LOG_FORMAT`.
+pub fn parse_log(out: &str) -> Vec<Commit> {
+    out.split('\0')
+        .filter_map(|record| {
+            let mut f = record.split('\x1f');
+            Some(Commit {
+                id: f.next().filter(|id| !id.is_empty())?.to_owned(),
+                parents: f.next()?.split_whitespace().map(str::to_owned).collect(),
+                author: f.next()?.to_owned(),
+                email: f.next()?.to_owned(),
+                time: f.next()?.parse().ok()?,
+                subject: f.next()?.to_owned(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -280,9 +338,11 @@ mod tests {
         let d = tmp.path();
         git(d, &["init", "-q", "-b", "main"]);
         assert_eq!(head_branch(d).unwrap().as_deref(), Some("main")); // unborn branch
+        assert_eq!(log(d, 100).unwrap(), vec![]); // no commits yet is not an error
         git(d, &["commit", "-q", "--allow-empty", "-m", "one"]);
         git(d, &["branch", "feature/x"]);
         git(d, &["tag", "v1"]);
+        git(d, &["tag", "-a", "v1-annotated", "-m", "release"]);
         // fake an upstream one commit behind, without any network (the remote URL is never contacted)
         git(
             d,
@@ -308,6 +368,26 @@ mod tests {
                 .any(|r| r.kind == RefKind::Remote && r.name == "origin/main")
         );
         assert!(r.iter().any(|r| r.kind == RefKind::Tag && r.name == "v1"));
+
+        let annotated = r.iter().find(|r| r.name == "v1-annotated").unwrap();
+        assert_ne!(annotated.target, annotated.commit); // tag object vs the commit it points at
+        assert_eq!(
+            annotated.commit,
+            r.iter().find(|r| r.name == "v1").unwrap().commit
+        );
+
+        git(d, &["switch", "-q", "feature/x"]);
+        git(d, &["commit", "-q", "--allow-empty", "-m", "feature work"]);
+        git(d, &["switch", "-q", "main"]);
+        git(
+            d,
+            &["merge", "-q", "--no-ff", "-m", "merge feature", "feature/x"],
+        );
+        let commits = log(d, 100).unwrap();
+        assert_eq!(commits[0].subject, "merge feature");
+        assert_eq!(commits[0].parents.len(), 2);
+        assert_eq!(commits[0].author, "Spork Test");
+        assert_eq!(log(d, 2).unwrap().len(), 2);
 
         git(d, &["switch", "-q", "--detach", "HEAD"]);
         assert_eq!(head_branch(d).unwrap(), None);

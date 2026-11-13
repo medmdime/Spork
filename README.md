@@ -6,9 +6,9 @@ Spork is a free, open-source Git client for **macOS, Windows and Linux**. It's b
 polished desktop clients like Fork and GitKraken offer (a clear commit graph, painless staging, safe history
 editing) but want it open, cross-platform, and owned by its community instead of a license key.
 
-> 🚧 **Spork is in early development.** It isn't ready for daily use yet. Today it opens a repository and shows its
-> branches, remotes and tags. The commit graph, staging and everything else below are being built in the open,
-> step by step. Star or watch the repo to follow along, and see [Status & roadmap](#status--roadmap).
+> 🚧 **Spork is in early development.** It isn't ready for daily use yet. Today it opens a repository, shows its
+> branches, remotes and tags, and draws the full commit graph. Commit details, diffs, staging and everything else
+> below are being built in the open, step by step. Star or watch the repo to follow along, and see [Status & roadmap](#status--roadmap).
 
 ## What Spork is
 
@@ -62,8 +62,8 @@ behaviour predictable and testable without a window. Details: [docs/00-overview.
 
 | Phase | Scope | State |
 |---|---|---|
-| **P0 Foundations** | git runner, error handling, repo view with branches/remotes/tags, themes, CI on 3 OSes | **in progress** |
-| P1 Read-only client | commit graph, commit details, diffs, blame, file history, search | next |
+| **P0 Foundations** | git runner, error handling, repo view with branches/remotes/tags, themes, CI on 3 OSes | mostly done (file watcher left) |
+| **P1 Read-only client** | commit graph ✓, commit details, diffs, blame, file history, search | **in progress** |
 | P2 Daily driver | staging (incl. line-level), commit, branches, fetch/pull/push, credentials | |
 | P3 History editing | merge, rebase, interactive rebase, conflict resolver, cherry-pick, stash, tags | |
 | P4 Breadth | clone, submodules, worktrees, git-flow, LFS, image diffs, workspaces | |
@@ -93,7 +93,8 @@ cargo test --workspace
 ## Project layout
 
 ```
-crates/spork-git   git runner, error classification, ref parsing (tested against real git)
+crates/spork-git   git runner, error classification, refs and commit log (tested against real git)
+crates/spork-graph commit-graph lane layout (pure, no I/O)
 bins/spork         the desktop app (GPUI Kit), themes in bins/spork/assets/themes
 docs/              architecture overview, 16 feature specs, AI and open-source policy
 scripts/           helpers for writing behaviour specs
