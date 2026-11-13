@@ -4,6 +4,7 @@ mod askpass;
 mod branches;
 mod changes;
 mod history;
+mod operations;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffState};
 use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, TitleBar, h_flex, v_flex};
@@ -22,7 +24,7 @@ use gpui_kit::component::{resizable_panel, v_resizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use history::{History, ROW_HEIGHT};
-use spork_git::{CommitDetails, GitError, Ref, RefKind, StatusEntry};
+use spork_git::{CommitDetails, GitError, OpState, Ref, RefKind, Stash, StatusEntry};
 
 // shortcut: fixed cap until the history loads incrementally (M05 §1 batches), then it becomes a setting.
 const MAX_COMMITS: usize = 50_000;
@@ -58,6 +60,9 @@ struct RepoView {
     branch_name: Entity<InputState>,
     /// Answer field of git's password / passphrase prompts (askpass.rs).
     prompt_input: Entity<InputState>,
+    /// "Stash changes" dialog state (operations.rs).
+    stash_message: Entity<InputState>,
+    stash_untracked: bool,
     _prompts: Option<Task<()>>,
     description: Entity<TextareaState>,
     amend: bool,
@@ -72,6 +77,8 @@ struct Loaded {
     head: Option<String>,
     refs: Vec<Ref>,
     status: Vec<StatusEntry>,
+    op: OpState,
+    stashes: Vec<Stash>,
     history: History,
 }
 
@@ -91,7 +98,9 @@ impl RepoView {
         let _diff_events = cx.subscribe(&change_diff, |_, _, event: &DiffEvent, cx| {
             if matches!(
                 event,
-                DiffEvent::SelectionChanged(_) | DiffEvent::SelectionEnded(_)
+                DiffEvent::SelectionChanged(_)
+                    | DiffEvent::SelectionEnded(_)
+                    | DiffEvent::ConflictResolved(..)
             ) {
                 cx.notify();
             }
@@ -114,6 +123,9 @@ impl RepoView {
             subject: cx.new(|cx| InputState::new(window, cx).placeholder("Commit subject")),
             branch_name: cx.new(|cx| InputState::new(window, cx).placeholder("feature/my-change")),
             prompt_input: cx.new(|cx| InputState::new(window, cx)),
+            stash_message: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Message (optional)")),
+            stash_untracked: true,
             _prompts: prompts.map(|rx| {
                 cx.spawn_in(window, async move |this, cx| {
                     while let Ok((prompt, reply)) = rx.recv().await {
@@ -286,11 +298,15 @@ fn load(path: &Path) -> Result<Loaded, GitError> {
     let root = spork_git::toplevel(path)?;
     let refs = spork_git::refs(&root)?;
     let status = spork_git::status(&root)?;
+    let op = spork_git::op_state(&root)?;
+    let stashes = spork_git::stashes(&root)?;
     let history = History::new(spork_git::log(&root, MAX_COMMITS)?, &refs);
     Ok(Loaded {
         head: spork_git::head_branch(&root)?,
         refs,
         status,
+        op,
+        stashes,
         history,
         root,
     })
@@ -407,6 +423,7 @@ impl RepoView {
                 .filter(move |r: &&Ref| r.kind == kind)
                 .collect::<Vec<_>>()
         };
+        let stash_items = self.stash_items(&repo.stashes, cx);
         let view = cx.entity();
         let locals = of(RefKind::Local);
         let remotes = of(RefKind::Remote);
@@ -441,6 +458,7 @@ impl RepoView {
                     )
                     .child(
                         h_flex()
+                            .child(self.stash_button(cx))
                             .child(self.remote_button(RemoteOp::Fetch, cx))
                             .child(self.remote_button(RemoteOp::Pull, cx))
                             .child(self.remote_button(RemoteOp::Push, cx)),
@@ -475,6 +493,7 @@ impl RepoView {
                         folder_tree(&remotes, 0, &view),
                     ),
                     section("Tags", tags.len(), IconName::Tag, tags),
+                    section("Stashes", stash_items.len(), IconName::Archive, stash_items),
                 ]),
             );
 
@@ -490,6 +509,7 @@ impl RepoView {
             .bg(theme.background)
             .rounded(theme.radius)
             .overflow_hidden();
+        let panel = panel.children(self.op_banner(cx));
 
         if self.view == View::Changes {
             let changes = self.changes_view(cx);
@@ -625,7 +645,7 @@ impl RepoView {
         &mut self,
         range: std::ops::Range<usize>,
         cx: &mut Context<Self>,
-    ) -> Vec<Stateful<Div>> {
+    ) -> Vec<AnyElement> {
         let Some(Ok(repo)) = &self.repo else {
             return Vec::new();
         };
@@ -633,6 +653,7 @@ impl RepoView {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
+        let view = cx.entity();
         let theme = cx.theme();
         let (muted, hover, active) = (theme.muted_foreground, theme.list_hover, theme.list_active);
         let mono = theme.mono_font_family.clone();
@@ -641,6 +662,7 @@ impl RepoView {
             .map(|ix| {
                 let commit = &h.commits[ix];
                 let labels = h.labels.get(&commit.id).into_iter().flatten();
+                let menu = RepoView::commit_menu(view.clone(), commit.id.clone());
                 h_flex()
                     .id(ix)
                     .w_full()
@@ -689,6 +711,8 @@ impl RepoView {
                             .text_color(muted)
                             .child(commit.id.chars().take(7).collect::<String>()),
                     )
+                    .context_menu(menu)
+                    .into_any_element()
             })
             .collect()
     }

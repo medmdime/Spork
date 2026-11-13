@@ -16,6 +16,8 @@ enum Action {
     CheckoutRemote,
     NewBranchFrom,
     Delete,
+    Merge,
+    Rebase,
 }
 
 /// Right-click menu for a branch, remote branch or tag in the sidebar.
@@ -38,10 +40,31 @@ pub fn ref_menu(
                 .item(item("Checkout", Action::Checkout).disabled(is_head))
                 .item(item("New branch from here…", Action::NewBranchFrom))
                 .item(PopupMenuItem::separator())
+                .item(
+                    item(&format!("Merge {name} into current branch"), Action::Merge)
+                        .disabled(is_head),
+                )
+                .item(
+                    item(
+                        &format!("Rebase current branch onto {name}"),
+                        Action::Rebase,
+                    )
+                    .disabled(is_head),
+                )
+                .item(PopupMenuItem::separator())
                 .item(item("Delete…", Action::Delete).disabled(is_head)),
             RefKind::Remote => menu
                 .item(item("Checkout", Action::CheckoutRemote))
-                .item(item("New branch from here…", Action::NewBranchFrom)),
+                .item(item("New branch from here…", Action::NewBranchFrom))
+                .item(PopupMenuItem::separator())
+                .item(item(
+                    &format!("Merge {name} into current branch"),
+                    Action::Merge,
+                ))
+                .item(item(
+                    &format!("Rebase current branch onto {name}"),
+                    Action::Rebase,
+                )),
             RefKind::Tag => menu.item(item("New branch from here…", Action::NewBranchFrom)),
         }
     }
@@ -74,45 +97,14 @@ impl RepoView {
                 },
                 notify_success,
             ),
-            Action::NewBranchFrom => {
-                self.branch_name
-                    .update(cx, |s, cx| s.set_value("", window, cx));
-                let input = self.branch_name.clone();
-                let muted = cx.theme().muted_foreground;
-                window.open_alert_dialog(cx, move |dialog, _, _| {
-                    let (view, input, start) = (view.clone(), input.clone(), name.clone());
-                    dialog
-                        .title("New branch")
-                        .description(
-                            v_flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(muted)
-                                        .child(format!("Starts at {start}, then switches to it.")),
-                                )
-                                .child(Input::new(&input)),
-                        )
-                        .confirm()
-                        .ok_text("Create branch")
-                        .on_ok(move |_, window, cx| {
-                            let new = input.read(cx).value().trim().to_owned();
-                            let start = start.clone();
-                            view.update(cx, |this, cx| {
-                                this.run_op(
-                                    window,
-                                    cx,
-                                    move |root| {
-                                        spork_git::create_branch(root, &new, Some(&start), true)
-                                            .map(|()| format!("Created and switched to {new}"))
-                                    },
-                                    notify_success,
-                                )
-                            });
-                            true
-                        })
-                });
+            Action::NewBranchFrom => self.new_branch_dialog(name, window, cx),
+            Action::Merge => self.run_outcome(window, cx, format!("Merged {name}"), move |root| {
+                spork_git::merge(root, &name)
+            }),
+            Action::Rebase => {
+                self.run_outcome(window, cx, format!("Rebased onto {name}"), move |root| {
+                    spork_git::rebase(root, &name)
+                })
             }
             Action::Delete => {
                 window.open_alert_dialog(cx, move |dialog, _, _| {
@@ -138,6 +130,54 @@ impl RepoView {
                 });
             }
         }
+    }
+
+    /// "New branch" dialog starting at `start` (a branch, tag or commit), then switches to it.
+    pub(crate) fn new_branch_dialog(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        self.branch_name
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        let input = self.branch_name.clone();
+        let muted = cx.theme().muted_foreground;
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (view, input, start) = (view.clone(), input.clone(), name.clone());
+            dialog
+                .title("New branch")
+                .description(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(format!("Starts at {start}, then switches to it.")),
+                        )
+                        .child(Input::new(&input)),
+                )
+                .confirm()
+                .ok_text("Create branch")
+                .on_ok(move |_, window, cx| {
+                    let new = input.read(cx).value().trim().to_owned();
+                    let start = start.clone();
+                    view.update(cx, |this, cx| {
+                        this.run_op(
+                            window,
+                            cx,
+                            move |root| {
+                                spork_git::create_branch(root, &new, Some(&start), true)
+                                    .map(|()| format!("Created and switched to {new}"))
+                            },
+                            notify_success,
+                        )
+                    });
+                    true
+                })
+        });
     }
 }
 

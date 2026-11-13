@@ -3,7 +3,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::diff::{Diff, DiffFile, DiffSide};
+use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffSide};
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
@@ -215,16 +215,32 @@ impl RepoView {
         };
         let root = repo.root.clone();
         self._change_diff_load = Some(cx.spawn(async move |this, cx| {
-            let patch = cx
-                .background_spawn(async move { spork_git::file_diff(&root, &entry, sel.staged) })
+            let conflicted = entry.conflicted;
+            let path = entry.path.clone();
+            let text = cx
+                .background_spawn(async move {
+                    if conflicted {
+                        // the working file with conflict markers, for the 3-way resolver (M11 §4)
+                        std::fs::read_to_string(root.join(&entry.path)).map_err(|e| {
+                            GitError::Other {
+                                code: None,
+                                stderr: e.to_string(),
+                            }
+                        })
+                    } else {
+                        spork_git::file_diff(&root, &entry, sel.staged)
+                    }
+                })
                 .await;
             this.update(cx, |this, cx| {
-                this.change_patch = patch.ok();
-                let files = this
-                    .change_patch
-                    .as_deref()
-                    .and_then(|p| DiffFile::parse(p).ok())
-                    .unwrap_or_default();
+                let files = match (&text, conflicted) {
+                    (Ok(t), true) => DiffFile::parse_conflicts(path, t)
+                        .map(|f| vec![f])
+                        .unwrap_or_default(),
+                    (Ok(p), false) => DiffFile::parse(p).unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                this.change_patch = if conflicted { None } else { text.ok() };
                 this.change_diff.update(cx, |s, cx| {
                     s.set_files(files, cx);
                     s.set_selected_lines(None, cx);
@@ -297,6 +313,29 @@ impl RepoView {
                                     .child(dir),
                             ),
                     )
+                    .when(entry.conflicted, |row| {
+                        let (mine, theirs) = (entry.path.clone(), entry.path.clone());
+                        row.child(
+                            Button::new(SharedString::from(format!("ours-{ix}")))
+                                .ghost()
+                                .xsmall()
+                                .label("Keep current")
+                                .tooltip("Resolve with the current branch's version (git checkout --ours)")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.resolve_conflict(mine.clone(), true, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("theirs-{ix}")))
+                                .ghost()
+                                .xsmall()
+                                .label("Take incoming")
+                                .tooltip("Resolve with the version being merged or applied (git checkout --theirs)")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.resolve_conflict(theirs.clone(), false, window, cx)
+                                })),
+                        )
+                    })
                     .when(!staged && !entry.conflicted, |row| {
                         let path = entry.path.clone();
                         row.child(
@@ -474,6 +513,65 @@ impl RepoView {
         );
     }
 
+    /// Writes the file as resolved in the conflict view and marks it resolved (stages it).
+    fn save_resolution(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.change_diff.read(cx).resolved_text(&path) else {
+            return;
+        };
+        self.run_op(
+            window,
+            cx,
+            move |root| {
+                std::fs::write(root.join(&path), text).map_err(|e| GitError::Other {
+                    code: None,
+                    stderr: e.to_string(),
+                })?;
+                spork_git::stage(root, &[&path])
+            },
+            |_, _, window, cx| {
+                window.push_notification(Notification::success("Conflict resolved"), cx)
+            },
+        );
+    }
+
+    /// Bar above a conflicted file: progress of the per-conflict choices and "Save resolution".
+    fn conflict_bar(&self, path: &str, cx: &mut Context<Self>) -> Option<Div> {
+        let state = self.change_diff.read(cx);
+        let file = state.files().iter().find(|f| f.path().as_ref() == path)?;
+        if file.status() != DiffFileStatus::Conflicted {
+            return None;
+        }
+        let total = file.conflicts().len();
+        let done = (0..total)
+            .filter(|&i| state.conflict_resolution(path, i).is_some())
+            .count();
+        let resolved = state.resolved_text(path);
+        let theme = cx.theme();
+        let (path, ready) = (path.to_owned(), resolved.is_some());
+        Some(
+            h_flex()
+                .flex_none()
+                .h(px(36.))
+                .px_3()
+                .justify_between()
+                .border_b_1()
+                .border_color(theme.border)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(format!("{done} of {total} resolved"))
+                .child(
+                    Button::new("save-resolution")
+                        .small()
+                        .primary()
+                        .label("Save resolution")
+                        .disabled(!ready || self.busy)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.save_resolution(path.clone(), window, cx)
+                        })),
+                ),
+        )
+    }
+
     /// Bar above the diff with actions for the selected lines.
     fn selection_bar(&self, staged: bool, cx: &mut Context<Self>) -> Option<Div> {
         let (patch, lines) = self.selected_patch_lines(cx)?;
@@ -553,6 +651,7 @@ impl RepoView {
         let right = match &self.change_selected {
             Some(sel) => v_flex()
                 .size_full()
+                .children(self.conflict_bar(&sel.path, cx))
                 .children(self.selection_bar(sel.staged, cx))
                 .child(Diff::new(&self.change_diff).size_full()),
             None => v_flex()
