@@ -263,6 +263,71 @@ pub fn parse_log(out: &str) -> Vec<Commit> {
         .collect()
 }
 
+/// Git's well-known empty tree: the "parent" of a root commit.
+pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetails {
+    /// Full message: subject, blank line, body.
+    pub message: String,
+    pub author_email: String,
+    pub author_date: String,
+    pub committer: String,
+    pub committer_email: String,
+    pub committer_date: String,
+    /// Unified patch against the first parent (or the empty tree for a root commit).
+    pub patch: String,
+}
+
+const DETAILS_FORMAT: &str = "--format=%ae%x1f%ad%x1f%cn%x1f%ce%x1f%cd%x1f%B";
+
+/// Details panel data for one commit (docs/specs/M06). Merges are shown against their first parent.
+pub fn commit_details(
+    repo: &Path,
+    id: &str,
+    first_parent: Option<&str>,
+) -> Result<CommitDetails, GitError> {
+    let meta = run(
+        repo,
+        &[
+            "show",
+            "-s",
+            "--date=format:%Y-%m-%d %H:%M",
+            DETAILS_FORMAT,
+            id,
+            "--",
+        ],
+    )?;
+    let meta = String::from_utf8_lossy(&meta);
+    let mut f = meta.splitn(6, '\x1f');
+    let mut next = || f.next().unwrap_or("").to_owned();
+    let (author_email, author_date, committer, committer_email, committer_date) =
+        (next(), next(), next(), next(), next());
+    let message = next().trim_end().to_owned();
+    let base = first_parent.unwrap_or(EMPTY_TREE);
+    let patch = run(
+        repo,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--find-renames",
+            base,
+            id,
+            "--",
+        ],
+    )?;
+    Ok(CommitDetails {
+        message,
+        author_email,
+        author_date,
+        committer,
+        committer_email,
+        committer_date,
+        patch: String::from_utf8_lossy(&patch).into_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +453,23 @@ mod tests {
         assert_eq!(commits[0].parents.len(), 2);
         assert_eq!(commits[0].author, "Spork Test");
         assert_eq!(log(d, 2).unwrap().len(), 2);
+
+        // details: root commit diffs against the empty tree, merges against their first parent
+        let root = commits.last().unwrap();
+        assert!(root.parents.is_empty());
+        let details = commit_details(d, &root.id, None).unwrap();
+        assert_eq!(details.message, "one");
+        assert_eq!(details.committer, "Spork Test");
+        assert_eq!(details.author_date.len(), "2026-01-01 00:00".len());
+
+        std::fs::write(d.join("hello.txt"), "hi\n").unwrap();
+        git(d, &["add", "hello.txt"]);
+        git(d, &["commit", "-q", "-m", "add hello", "-m", "with a body"]);
+        let c = &log(d, 1).unwrap()[0];
+        let details = commit_details(d, &c.id, c.parents.first().map(String::as_str)).unwrap();
+        assert_eq!(details.message, "add hello\n\nwith a body");
+        assert!(details.patch.contains("+++ b/hello.txt"));
+        assert!(details.patch.contains("+hi"));
 
         git(d, &["switch", "-q", "--detach", "HEAD"]);
         assert_eq!(head_branch(d).unwrap(), None);

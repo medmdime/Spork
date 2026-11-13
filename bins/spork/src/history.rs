@@ -126,9 +126,14 @@ pub fn graph_cell(row: &Row, is_merge: bool, lanes: usize, cx: &App) -> impl Int
             ));
         },
     )
-    .w(px(LANE_WIDTH * lanes as f32 + 6.))
+    .w(graph_width(lanes))
     .h_full()
     .flex_none()
+}
+
+/// Width of the graph column; never narrower than its "Graph" header.
+fn graph_width(lanes: usize) -> Pixels {
+    px((LANE_WIDTH * lanes as f32 + 6.).max(44.))
 }
 
 pub fn label_badge(label: &Label, cx: &App) -> impl IntoElement {
@@ -172,12 +177,7 @@ pub fn header(lanes: usize, cx: &App) -> impl IntoElement {
         .gap_3()
         .text_xs()
         .text_color(muted)
-        .child(
-            div()
-                .w(px(LANE_WIDTH * lanes as f32 + 6.))
-                .flex_none()
-                .child("Graph"),
-        )
+        .child(div().w(graph_width(lanes)).flex_none().child("Graph"))
         .child(div().flex_1().min_w_0().child("Description"))
         .child(div().w(px(150.)).flex_none().child("Author"))
         .child(div().w(px(50.)).flex_none().child("Date"))

@@ -8,12 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{resizable_panel, v_resizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use history::{History, ROW_HEIGHT};
-use spork_git::{GitError, Ref, RefKind};
+use spork_git::{CommitDetails, GitError, Ref, RefKind};
 
 // shortcut: fixed cap until the history loads incrementally (M05 §1 batches), then it becomes a setting.
 const MAX_COMMITS: usize = 50_000;
@@ -23,7 +25,11 @@ struct RepoView {
     /// `None` until the first load finishes.
     repo: Option<Result<Loaded, GitError>>,
     selected: Option<usize>,
+    /// Details of the selected commit; `None` while loading.
+    details: Option<Result<CommitDetails, GitError>>,
+    diff: Entity<DiffState>,
     _load: Option<Task<()>>,
+    _details_load: Option<Task<()>>,
     _appearance: Subscription,
 }
 
@@ -44,7 +50,10 @@ impl RepoView {
             requested,
             repo: None,
             selected: None,
+            details: None,
+            diff: cx.new(|cx| DiffState::new([], cx)),
             _load: None,
+            _details_load: None,
             _appearance,
         };
         view.reload(cx);
@@ -64,6 +73,44 @@ impl RepoView {
         }));
     }
 }
+
+impl RepoView {
+    /// Selects a commit and loads its details + patch in the background (M06).
+    fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(Ok(repo)) = &self.repo else { return };
+        let Some(commit) = repo.history.commits.get(ix) else {
+            return;
+        };
+        self.selected = Some(ix);
+        self.details = None;
+        let (root, id) = (repo.root.clone(), commit.id.clone());
+        let parent = commit.parents.first().cloned();
+        // replacing the task drops (cancels) a load for a previously clicked commit
+        self._details_load = Some(cx.spawn(async move |this, cx| {
+            let details = cx
+                .background_spawn(async move {
+                    spork_git::commit_details(&root, &id, parent.as_deref())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                // shortcut: whole-patch parse; huge commits get a per-file lazy diff in M08
+                let files = match &details {
+                    Ok(d) if d.patch.len() <= MAX_PATCH_BYTES => {
+                        DiffFile::parse(&d.patch).unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                this.diff.update(cx, |state, cx| state.set_files(files, cx));
+                this.details = Some(details);
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+}
+
+const MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
 
 fn load(path: &Path) -> Result<Loaded, GitError> {
     let root = spork_git::toplevel(path)?;
@@ -251,10 +298,15 @@ impl RepoView {
             .rounded(theme.radius)
             .overflow_hidden();
 
-        let panel = if count == 0 {
-            panel.child(centered("No commits yet".into()))
-        } else {
-            panel.child(history::header(lanes, cx)).child(
+        if count == 0 {
+            return base
+                .child(sidebar)
+                .child(panel.child(centered("No commits yet".into())));
+        }
+        let list = v_flex()
+            .size_full()
+            .child(history::header(lanes, cx))
+            .child(
                 uniform_list(
                     "history",
                     count,
@@ -262,9 +314,114 @@ impl RepoView {
                 )
                 .flex_1()
                 .min_h_0(),
+            );
+        let panel = if self.selected.is_some() {
+            panel.child(
+                v_resizable("history-split")
+                    .child(resizable_panel().child(list))
+                    .child(
+                        resizable_panel()
+                            .size(px(380.))
+                            .child(self.details_view(cx)),
+                    ),
             )
+        } else {
+            panel.child(list)
         };
         base.child(sidebar).child(panel)
+    }
+
+    fn details_view(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.border);
+        let mono = theme.mono_font_family.clone();
+        let pane = v_flex().size_full().border_t_1().border_color(border);
+        let centered = |msg: String| {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(muted)
+                .child(msg)
+        };
+        let (Some(ix), Some(Ok(repo))) = (self.selected, &self.repo) else {
+            return pane;
+        };
+        let commit = &repo.history.commits[ix];
+        let details = match &self.details {
+            None => return pane.child(centered("Loading commit…".into())),
+            Some(Err(e)) => return pane.child(centered(e.to_string())),
+            Some(Ok(d)) => d,
+        };
+
+        let (_, body) = details
+            .message
+            .split_once("\n\n")
+            .unwrap_or((&details.message, ""));
+        let mut who = format!(
+            "{} <{}> · {}",
+            commit.author, details.author_email, details.author_date
+        );
+        if details.committer != commit.author {
+            who.push_str(&format!(
+                "   committed by {} · {}",
+                details.committer, details.committer_date
+            ));
+        }
+        let short = |id: &String| id.chars().take(7).collect::<String>();
+        let parents = commit
+            .parents
+            .iter()
+            .map(short)
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let summary = v_flex()
+            .flex_none()
+            .max_h(px(160.))
+            .overflow_hidden()
+            .px_4()
+            .py_3()
+            .gap_1()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(commit.subject.clone()),
+            )
+            .when(!body.trim().is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(body.trim().to_owned()),
+                )
+            })
+            .child(div().text_xs().text_color(muted).child(who))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .text_xs()
+                    .text_color(muted)
+                    .font_family(mono)
+                    .child(commit.id.clone())
+                    .when(!parents.is_empty(), |d| {
+                        d.child(format!("parents {parents}"))
+                    }),
+            );
+
+        let body = if details.patch.len() > MAX_PATCH_BYTES {
+            centered("This commit is too large to show inline.".into())
+        } else if details.patch.is_empty() {
+            centered("No file changes".into())
+        } else {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(Diff::new(&self.diff).size_full())
+        };
+        pane.child(summary).child(body)
     }
 
     fn history_rows(
@@ -296,10 +453,7 @@ impl RepoView {
                     .text_sm()
                     .when(self.selected == Some(ix), |row| row.bg(active))
                     .hover(move |row| row.bg(hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected = Some(ix);
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select(ix, cx)))
                     .child(history::graph_cell(
                         &h.rows[ix],
                         commit.parents.len() > 1,
