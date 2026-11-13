@@ -67,8 +67,17 @@ pub fn git_binary() -> PathBuf {
 }
 
 /// Run git in `repo` and return stdout. Never prompts on a terminal.
-// shortcut: blocking and no stdin/progress/cancel yet; becomes async with jobs when network ops land (P2).
+// shortcut: blocking, no progress/cancel yet; network ops get a job runner with progress in M09.
 pub fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    run_with_input(repo, args, None)
+}
+
+/// Like [`run`], feeding `input` to git's stdin (commit messages, pathspec lists).
+pub fn run_with_input(
+    repo: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>, GitError> {
     let mut cmd = Command::new(git_binary());
     cmd.args(["-c", "core.quotepath=false", "-c", "color.ui=false"])
         .args(args)
@@ -77,7 +86,13 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
         .env("LC_ALL", "C")
         // reads must not take the index lock behind the user's back
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
+        // paths are always literal: a file named `*.rs` or `:x` is never a pattern
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(windows)]
@@ -85,8 +100,17 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let out = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| GitError::GitMissing(e.to_string()))?;
+    if let Some(input) = input {
+        // write from a thread so a large stdin can't deadlock against a full stdout pipe
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let input = input.to_vec();
+        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, &input));
+    }
+    let out = child
+        .wait_with_output()
         .map_err(|e| GitError::GitMissing(e.to_string()))?;
     if out.status.success() {
         Ok(out.stdout)
@@ -328,6 +352,168 @@ pub fn commit_details(
     })
 }
 
+/// One changed path from `git status --porcelain=v2` (docs/specs/M07 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub path: String,
+    /// Previous path for renames/copies.
+    pub orig_path: Option<String>,
+    /// Index (staged) state: `.` unchanged, `M`, `A`, `D`, `R`, `C`, `T`; `?` untracked.
+    pub index: char,
+    /// Work-tree (unstaged) state, same letters.
+    pub worktree: char,
+    pub conflicted: bool,
+}
+
+impl StatusEntry {
+    pub fn untracked(&self) -> bool {
+        self.index == '?'
+    }
+    pub fn has_staged(&self) -> bool {
+        !self.conflicted && !self.untracked() && self.index != '.'
+    }
+    pub fn has_unstaged(&self) -> bool {
+        self.conflicted || self.untracked() || self.worktree != '.'
+    }
+}
+
+pub fn status(repo: &Path) -> Result<Vec<StatusEntry>, GitError> {
+    let out = run(
+        repo,
+        &[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--find-renames",
+        ],
+    )?;
+    Ok(parse_status(&String::from_utf8_lossy(&out)))
+}
+
+/// Parse `git status --porcelain=v2 -z` output.
+pub fn parse_status(out: &str) -> Vec<StatusEntry> {
+    let mut entries = Vec::new();
+    let mut records = out.split('\0');
+    while let Some(record) = records.next() {
+        let entry = |xy: &str, path: &str, orig: Option<&str>, conflicted| {
+            let mut c = xy.chars();
+            StatusEntry {
+                path: path.to_owned(),
+                orig_path: orig.map(str::to_owned),
+                index: c.next().unwrap_or('.'),
+                worktree: c.next().unwrap_or('.'),
+                conflicted,
+            }
+        };
+        match record.split_once(' ') {
+            // ordinary: 1 XY sub mH mI mW hH hI path
+            Some(("1", rest)) => {
+                if let [xy, .., path] = rest.splitn(8, ' ').collect::<Vec<_>>()[..] {
+                    entries.push(entry(xy, path, None, false));
+                }
+            }
+            // rename/copy: 2 XY sub mH mI mW hH hI score path, then origPath as its own record
+            Some(("2", rest)) => {
+                if let [xy, .., path] = rest.splitn(9, ' ').collect::<Vec<_>>()[..] {
+                    entries.push(entry(xy, path, records.next(), false));
+                }
+            }
+            // unmerged: u XY sub m1 m2 m3 mW h1 h2 h3 path
+            Some(("u", rest)) => {
+                if let [xy, .., path] = rest.splitn(10, ' ').collect::<Vec<_>>()[..] {
+                    entries.push(entry(xy, path, None, true));
+                }
+            }
+            Some(("?", path)) => entries.push(entry("??", path, None, false)),
+            _ => {} // `!` ignored, `#` headers, trailing empty record
+        }
+    }
+    entries
+}
+
+/// `git add` the paths (also records deletions).
+pub fn stage(repo: &Path, paths: &[&str]) -> Result<(), GitError> {
+    with_pathspecs(repo, &["add", "--all"], paths)
+}
+
+/// Remove the paths from the index, keeping work-tree changes. Works before the first commit too.
+pub fn unstage(repo: &Path, paths: &[&str]) -> Result<(), GitError> {
+    if run(repo, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok() {
+        with_pathspecs(repo, &["restore", "--staged"], paths)
+    } else {
+        with_pathspecs(repo, &["rm", "--cached", "-r", "--quiet"], paths)
+    }
+}
+
+/// Runs `git <args> --pathspec-from-file=-` with NUL-separated paths on stdin (no argv length limits).
+fn with_pathspecs(repo: &Path, args: &[&str], paths: &[&str]) -> Result<(), GitError> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut input = Vec::new();
+    for p in paths {
+        input.extend_from_slice(p.as_bytes());
+        input.push(0);
+    }
+    let args = [args, &["--pathspec-from-file=-", "--pathspec-file-nul"]].concat();
+    run_with_input(repo, &args, Some(&input)).map(drop)
+}
+
+/// Commits the index with `message` (hooks run as usual). `amend` replaces HEAD.
+pub fn commit(repo: &Path, message: &str, amend: bool) -> Result<(), GitError> {
+    let mut args = vec!["commit", "--cleanup=strip", "-F", "-"];
+    if amend {
+        args.push("--amend");
+    }
+    run_with_input(repo, &args, Some(message.as_bytes())).map(drop)
+}
+
+/// Full message of HEAD (prefill for amend), or `None` before the first commit.
+pub fn head_message(repo: &Path) -> Option<String> {
+    let out = run(repo, &["log", "-1", "--format=%B", "HEAD", "--"]).ok()?;
+    Some(String::from_utf8_lossy(&out).trim_end().to_owned())
+}
+
+/// Patch for one changed file: staged (HEAD→index) or unstaged (index→work tree; untracked shown as added).
+pub fn file_diff(repo: &Path, entry: &StatusEntry, staged: bool) -> Result<String, GitError> {
+    let base = ["diff", "--no-color", "--no-ext-diff", "--find-renames"];
+    let out = if staged {
+        let mut paths = vec![entry.path.as_str()];
+        paths.extend(entry.orig_path.as_deref());
+        run(repo, &[&base[..], &["--cached", "--"], &paths].concat())?
+    } else if entry.untracked() {
+        run_allowing_diff(
+            repo,
+            &[&base[..], &["--no-index", "--", NULL_DEVICE, &entry.path]].concat(),
+        )?
+    } else {
+        run(repo, &[&base[..], &["--", &entry.path]].concat())?
+    };
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_DEVICE: &str = "/dev/null";
+
+/// For `diff --no-index`, exit code 1 means "files differ" and stdout holds the patch.
+fn run_allowing_diff(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    let out = Command::new(git_binary())
+        .args(["-c", "core.quotepath=false", "-c", "color.ui=false"])
+        .args(args)
+        .current_dir(repo)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| GitError::GitMissing(e.to_string()))?;
+    match out.status.code() {
+        Some(0 | 1) => Ok(out.stdout),
+        code => Err(classify(code, &String::from_utf8_lossy(&out.stderr))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +662,99 @@ mod tests {
         std::fs::create_dir(d.join("sub")).unwrap();
         let top = toplevel(&d.join("sub")).unwrap();
         assert_eq!(top.canonicalize().unwrap(), d.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn working_copy_status_stage_unstage_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let write = |p: &str, c: &str| std::fs::write(d.join(p), c).unwrap();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.name", "Spork Test"]);
+        git(d, &["config", "user.email", "test@spork.invalid"]);
+        git(d, &["config", "commit.gpgsign", "false"]);
+
+        // before the first commit: stage + unstage must work on an unborn HEAD
+        write("a.txt", "one\n");
+        stage(d, &["a.txt"]).unwrap();
+        assert!(status(d).unwrap()[0].has_staged());
+        unstage(d, &["a.txt"]).unwrap();
+        assert!(status(d).unwrap()[0].untracked());
+        stage(d, &["a.txt"]).unwrap();
+        assert_eq!(head_message(d), None);
+        commit(d, "first\n\nbody line", false).unwrap();
+        assert_eq!(head_message(d).as_deref(), Some("first\n\nbody line"));
+
+        write("a.txt", "one\ntwo\n"); // modified, unstaged
+        write("star*.txt", "x\n"); // untracked, name with a glob char
+        write("gone.txt", "bye\n");
+        stage(d, &["gone.txt"]).unwrap();
+        commit(d, "add gone", false).unwrap();
+        std::fs::remove_file(d.join("gone.txt")).unwrap(); // deleted
+        git(d, &["mv", "a.txt", "b.txt"]); // staged rename (with an unstaged edit inside)
+
+        let st = status(d).unwrap();
+        let find = |p: &str| {
+            st.iter()
+                .find(|e| e.path == p)
+                .unwrap_or_else(|| panic!("{p} in {st:?}"))
+        };
+        assert!(find("star*.txt").untracked());
+        assert_eq!(
+            (find("gone.txt").index, find("gone.txt").worktree),
+            ('.', 'D')
+        );
+        let renamed = find("b.txt");
+        assert_eq!(
+            (renamed.index, renamed.orig_path.as_deref()),
+            ('R', Some("a.txt"))
+        );
+
+        // literal pathspec: staging `star*.txt` must not touch other files
+        stage(d, &["star*.txt", "gone.txt"]).unwrap();
+        let st = status(d).unwrap();
+        assert!(st.iter().any(|e| e.path == "star*.txt" && e.index == 'A'));
+        assert!(st.iter().any(|e| e.path == "gone.txt" && e.index == 'D'));
+        unstage(d, &["star*.txt"]).unwrap();
+        let st = status(d).unwrap();
+        assert!(st.iter().any(|e| e.path == "star*.txt" && e.untracked()));
+
+        // per-file diffs: untracked shows as added, staged rename shows as rename
+        let star = st.iter().find(|e| e.path == "star*.txt").unwrap();
+        assert!(file_diff(d, star, false).unwrap().contains("+x"));
+        let renamed = st.iter().find(|e| e.path == "b.txt").unwrap();
+        assert!(
+            file_diff(d, renamed, true)
+                .unwrap()
+                .contains("rename to b.txt")
+        );
+        assert!(file_diff(d, renamed, false).unwrap().contains("+two"));
+
+        // amend rewrites HEAD's message without adding a commit
+        commit(d, "add gone (amended)", true).unwrap();
+        assert_eq!(head_message(d).as_deref(), Some("add gone (amended)"));
+        assert_eq!(log(d, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parses_porcelain_v2_records() {
+        let out = "1 .M N... 100644 100644 100644 aaa bbb src/main.rs\0\
+                   2 R. N... 100644 100644 100644 aaa bbb R100 new name.rs\0old name.rs\0\
+                   u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
+                   ? notes/todo.md\0";
+        let st = parse_status(out);
+        assert_eq!(st.len(), 4);
+        assert_eq!(
+            (st[0].path.as_str(), st[0].index, st[0].worktree),
+            ("src/main.rs", '.', 'M')
+        );
+        assert!(st[0].has_unstaged() && !st[0].has_staged());
+        assert_eq!(
+            (st[1].path.as_str(), st[1].orig_path.as_deref()),
+            ("new name.rs", Some("old name.rs"))
+        );
+        assert!(st[2].conflicted && st[2].has_unstaged() && !st[2].has_staged());
+        assert!(st[3].untracked());
     }
 
     #[test]

@@ -1,27 +1,37 @@
 //! Spork desktop app. P1: repository sidebar (docs/specs/M03) and commit list with graph (M05).
 
+mod changes;
 mod history;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use changes::ChangeSelection;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
+use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, TitleBar, h_flex, v_flex};
 use gpui_kit::component::{resizable_panel, v_resizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use history::{History, ROW_HEIGHT};
-use spork_git::{CommitDetails, GitError, Ref, RefKind};
+use spork_git::{CommitDetails, GitError, Ref, RefKind, StatusEntry};
 
 // shortcut: fixed cap until the history loads incrementally (M05 §1 batches), then it becomes a setting.
 const MAX_COMMITS: usize = 50_000;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Changes,
+    History,
+}
+
 struct RepoView {
     requested: PathBuf,
+    view: View,
     /// `None` until the first load finishes.
     repo: Option<Result<Loaded, GitError>>,
     selected: Option<usize>,
@@ -32,6 +42,16 @@ struct RepoView {
     _details_load: Option<Task<()>>,
     /// Watches the repository so external changes (terminal, IDE) show up without Refresh.
     _watcher: Option<(notify::RecommendedWatcher, Task<()>)>,
+    // working copy (changes.rs)
+    change_selected: Option<ChangeSelection>,
+    change_diff: Entity<DiffState>,
+    _change_diff_load: Option<Task<()>>,
+    subject: Entity<InputState>,
+    description: Entity<TextareaState>,
+    amend: bool,
+    /// A git write (stage, commit…) is running.
+    busy: bool,
+    _op: Option<Task<()>>,
     _appearance: Subscription,
 }
 
@@ -39,6 +59,7 @@ struct Loaded {
     root: PathBuf,
     head: Option<String>,
     refs: Vec<Ref>,
+    status: Vec<StatusEntry>,
     history: History,
 }
 
@@ -50,6 +71,7 @@ impl RepoView {
         });
         let mut view = Self {
             requested,
+            view: View::History,
             repo: None,
             selected: None,
             details: None,
@@ -57,6 +79,15 @@ impl RepoView {
             _load: None,
             _details_load: None,
             _watcher: None,
+            change_selected: None,
+            change_diff: cx.new(|cx| DiffState::new([], cx)),
+            _change_diff_load: None,
+            subject: cx.new(|cx| InputState::new(window, cx).placeholder("Commit subject")),
+            description: cx
+                .new(|cx| TextareaState::new(window, cx).placeholder("Description (optional)")),
+            amend: false,
+            busy: false,
+            _op: None,
             _appearance,
         };
         view.reload(cx);
@@ -85,6 +116,8 @@ impl RepoView {
                         this.watch(root, cx);
                     }
                 }
+                // refresh the open file diff (or clear it if the file is no longer changed)
+                this.select_change(this.change_selected.clone(), cx);
                 cx.notify();
             })
             .ok();
@@ -174,10 +207,12 @@ const MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
 fn load(path: &Path) -> Result<Loaded, GitError> {
     let root = spork_git::toplevel(path)?;
     let refs = spork_git::refs(&root)?;
+    let status = spork_git::status(&root)?;
     let history = History::new(spork_git::log(&root, MAX_COMMITS)?, &refs);
     Ok(Loaded {
         head: spork_git::head_branch(&root)?,
         refs,
+        status,
         history,
         root,
     })
@@ -328,21 +363,37 @@ impl RepoView {
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     ),
             )
-            .child(SidebarMenu::new().children([
-                section(
-                    "Branches",
-                    locals.len(),
-                    IconName::GitBranch,
-                    folder_tree(&locals, 0),
-                ),
-                section(
-                    "Remotes",
-                    remotes.len(),
-                    IconName::Globe,
-                    folder_tree(&remotes, 0),
-                ),
-                section("Tags", tags.len(), IconName::Tag, tags),
-            ]));
+            .child(
+                SidebarMenu::new().children([
+                    SidebarMenuItem::new(format!("Local Changes ({})", repo.status.len()))
+                        .icon(IconName::FilePen)
+                        .active(self.view == View::Changes)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.view = View::Changes;
+                            cx.notify();
+                        })),
+                    SidebarMenuItem::new("All Commits")
+                        .icon(IconName::GitCommitHorizontal)
+                        .active(self.view == View::History)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.view = View::History;
+                            cx.notify();
+                        })),
+                    section(
+                        "Branches",
+                        locals.len(),
+                        IconName::GitBranch,
+                        folder_tree(&locals, 0),
+                    ),
+                    section(
+                        "Remotes",
+                        remotes.len(),
+                        IconName::Globe,
+                        folder_tree(&remotes, 0),
+                    ),
+                    section("Tags", tags.len(), IconName::Tag, tags),
+                ]),
+            );
 
         let count = repo.history.commits.len();
         let lanes = repo.history.graph_lanes;
@@ -357,6 +408,10 @@ impl RepoView {
             .rounded(theme.radius)
             .overflow_hidden();
 
+        if self.view == View::Changes {
+            let changes = self.changes_view(cx);
+            return base.child(sidebar).child(panel.child(changes));
+        }
         if count == 0 {
             return base
                 .child(sidebar)
