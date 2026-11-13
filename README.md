@@ -106,7 +106,7 @@ docs, or simply opening an issue with what you need from a Git client.
 
 1. Pick a module in [`docs/specs/`](docs/specs) (each lists its open questions and tests).
 2. Open an issue or draft PR to say what you're working on.
-3. Sign off your commits (`git commit -s`), as Spork uses the [DCO](https://developercertificate.org).
+3. Follow [CONTRIBUTING.md](CONTRIBUTING.md): Conventional Commit messages, one branch per change, and a DCO sign-off (`git commit -s`).
 
 **Clean-room rule:** Spork is an independent implementation. Don't submit code, pseudo-code or text derived
 from decompiling or disassembling proprietary software. Specs describe observable behaviour only, and code is

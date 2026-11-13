@@ -20,7 +20,8 @@ This is what protects the project; put it at the top of CONTRIBUTING.md:
 - PR template checkbox: "I have not used decompiled proprietary code or output from reverse-engineering tools in this PR."
 
 ## 4. Repo & workflow
-- Monorepo layout from overview §3.1. `main` always releasable; feature flags for unfinished modules.
+- Monorepo layout from overview §3.1. Branching and commit rules are in [CONTRIBUTING.md](../CONTRIBUTING.md): `main` = production (tagged releases), `develop` = integration, one `feat/<topic>` / `fix/<topic>` branch per change, Conventional Commit messages with no co-author/attribution trailers. Enforced with branch protection once the app is stable.
+- Every push to every branch runs all test suites (CI below); required checks on `develop` and `main` once enforcement starts.
 - GitHub Actions matrix: macOS 14 arm64, macOS 13 x64, Ubuntu 24.04 (X11 + Wayland headless), Windows 2022. Jobs: fmt, clippy `-D warnings`, test, `cargo deny`, fixture integration tests, nightly perf + AI evals.
 - Issues: labels per module `M01…M16`, `good first issue` on parsers/specs/fixtures, `parity` for gaps vs the reference UX.
 - RFCs (`docs/rfcs/`) for anything that changes architecture, settings format, or adds a dependency.
