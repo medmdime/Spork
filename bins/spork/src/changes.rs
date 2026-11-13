@@ -3,7 +3,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::diff::{Diff, DiffFile};
+use gpui_kit::component::diff::{Diff, DiffFile, DiffSide};
 use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
@@ -12,7 +12,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use spork_git::{GitError, StatusEntry};
+use spork_git::{GitError, PatchTarget, StatusEntry};
+use spork_patch::{FilePatch, Side};
 
 use crate::RepoView;
 
@@ -218,11 +219,16 @@ impl RepoView {
                 .background_spawn(async move { spork_git::file_diff(&root, &entry, sel.staged) })
                 .await;
             this.update(cx, |this, cx| {
-                let files = patch
-                    .ok()
-                    .and_then(|p| DiffFile::parse(&p).ok())
+                this.change_patch = patch.ok();
+                let files = this
+                    .change_patch
+                    .as_deref()
+                    .and_then(|p| DiffFile::parse(p).ok())
                     .unwrap_or_default();
-                this.change_diff.update(cx, |s, cx| s.set_files(files, cx));
+                this.change_diff.update(cx, |s, cx| {
+                    s.set_files(files, cx);
+                    s.set_selected_lines(None, cx);
+                });
                 cx.notify();
             })
             .ok();
@@ -421,6 +427,133 @@ impl RepoView {
             )
     }
 
+    /// Selected diff lines → display indices in the open file's patch, if a selection exists.
+    fn selected_patch_lines(
+        &self,
+        cx: &App,
+    ) -> Option<(FilePatch, std::ops::RangeInclusive<usize>)> {
+        let range = self.change_diff.read(cx).selected_lines()?;
+        let patch = FilePatch::parse(self.change_patch.as_deref()?)?;
+        let side = |s: DiffSide| match s {
+            DiffSide::Original => Side::Old,
+            DiffSide::Modified => Side::New,
+        };
+        let lines = patch.range(
+            (side(range.side()), range.start()),
+            (side(range.end_side()), range.end()),
+        )?;
+        Some((patch, lines))
+    }
+
+    /// Stage / unstage / discard only the selected lines (M07 §4).
+    fn apply_selection(
+        &mut self,
+        target: PatchTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((patch, lines)) = self.selected_patch_lines(cx) else {
+            return;
+        };
+        let reverse = target != PatchTarget::Stage;
+        let Some(partial) = patch.partial(|i, _| lines.contains(&i), reverse) else {
+            window.push_notification(
+                Notification::error("The selection contains no changed lines."),
+                cx,
+            );
+            return;
+        };
+        self.run_op(
+            window,
+            cx,
+            move |root| spork_git::apply_patch(root, &partial, target),
+            |this, _, _, cx| {
+                this.change_diff
+                    .update(cx, |s, cx| s.set_selected_lines(None, cx))
+            },
+        );
+    }
+
+    /// Bar above the diff with actions for the selected lines.
+    fn selection_bar(&self, staged: bool, cx: &mut Context<Self>) -> Option<Div> {
+        let (patch, lines) = self.selected_patch_lines(cx)?;
+        let changed = patch
+            .lines()
+            .enumerate()
+            .filter(|(i, l)| lines.contains(i) && l.is_change())
+            .count();
+        let theme = cx.theme();
+        let bar = h_flex()
+            .flex_none()
+            .h(px(36.))
+            .px_3()
+            .gap_2()
+            .justify_between()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.muted_foreground);
+        if !patch.supports_partial() {
+            return Some(bar.child("Deleted files can only be staged as a whole."));
+        }
+        let label = match changed {
+            1 => "1 line selected".to_owned(),
+            n => format!("{n} lines selected"),
+        };
+        let action = |id: &'static str, text: &'static str, target: PatchTarget| {
+            Button::new(id)
+                .small()
+                .label(text)
+                .disabled(changed == 0 || self.busy)
+                .on_click(cx.listener(move |this, _, window, cx| match target {
+                    PatchTarget::Discard => this.confirm_discard_lines(window, cx),
+                    _ => this.apply_selection(target, window, cx),
+                }))
+        };
+        let buttons = if staged {
+            h_flex().gap_2().child(
+                action(
+                    "unstage-lines",
+                    "Unstage lines",
+                    PatchTarget::Unstage,
+                )
+                .primary(),
+            )
+        } else {
+            h_flex()
+                .gap_2()
+                .child(
+                    action(
+                        "discard-lines",
+                        "Discard lines…",
+                        PatchTarget::Discard,
+                    )
+                    .ghost(),
+                )
+                .child(action("stage-lines", "Stage lines", PatchTarget::Stage).primary())
+        };
+        Some(bar.child(label).child(buttons))
+    }
+
+    fn confirm_discard_lines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title("Discard the selected lines?")
+                .description("These changes are removed from the file and can't be recovered.")
+                .confirm()
+                .ok_text("Discard")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.apply_selection(PatchTarget::Discard, window, cx)
+                    });
+                    true
+                })
+        });
+    }
+
     pub fn changes_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let left = v_flex()
@@ -430,8 +563,9 @@ impl RepoView {
             .child(self.file_section(true, cx))
             .child(self.commit_box(cx));
         let right = match &self.change_selected {
-            Some(_) => v_flex()
+            Some(sel) => v_flex()
                 .size_full()
+                .children(self.selection_bar(sel.staged, cx))
                 .child(Diff::new(&self.change_diff).size_full()),
             None => v_flex()
                 .size_full()

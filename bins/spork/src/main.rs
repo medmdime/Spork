@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use changes::ChangeSelection;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
+use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffState};
 use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
@@ -48,6 +48,9 @@ struct RepoView {
     // working copy (changes.rs)
     change_selected: Option<ChangeSelection>,
     change_diff: Entity<DiffState>,
+    /// Raw patch of the open file, for line staging (spork-patch).
+    change_patch: Option<String>,
+    _diff_events: Subscription,
     _change_diff_load: Option<Task<()>>,
     subject: Entity<InputState>,
     /// Name field of the "New branch" dialog (branches.rs).
@@ -74,6 +77,16 @@ impl RepoView {
         let _appearance = cx.observe_window_appearance(window, |_, window, cx| {
             Theme::sync_system_appearance(Some(window), cx)
         });
+        let change_diff = cx.new(|cx| DiffState::new([], cx));
+        // the selection bar above the diff follows the line selection
+        let _diff_events = cx.subscribe(&change_diff, |_, _, event: &DiffEvent, cx| {
+            if matches!(
+                event,
+                DiffEvent::SelectionChanged(_) | DiffEvent::SelectionEnded(_)
+            ) {
+                cx.notify();
+            }
+        });
         let mut view = Self {
             requested,
             view: View::History,
@@ -85,8 +98,10 @@ impl RepoView {
             _details_load: None,
             _watcher: None,
             change_selected: None,
-            change_diff: cx.new(|cx| DiffState::new([], cx)),
+            change_diff,
             _change_diff_load: None,
+            change_patch: None,
+            _diff_events,
             subject: cx.new(|cx| InputState::new(window, cx).placeholder("Commit subject")),
             branch_name: cx.new(|cx| InputState::new(window, cx).placeholder("feature/my-change")),
             description: cx

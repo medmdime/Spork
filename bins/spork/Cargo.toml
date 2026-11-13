@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 spork-git = { path = "../../crates/spork-git" }
 spork-graph = { path = "../../crates/spork-graph" }
+spork-patch = { path = "../../crates/spork-patch" }
 gpui-kit = "0.9.1"
 notify = "8.2"
 smol = "2"

@@ -483,6 +483,30 @@ pub fn discard(repo: &Path, entries: &[StatusEntry]) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Where a partial patch from `spork-patch` is applied (docs/specs/M07 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchTarget {
+    /// Forward patch into the index.
+    Stage,
+    /// Reverse patch out of the index.
+    Unstage,
+    /// Reverse patch out of the work tree (throws the selected changes away).
+    Discard,
+}
+
+/// Applies a patch to the index or work tree. Git rejects patches that don't fit, so a failure
+/// changes nothing.
+pub fn apply_patch(repo: &Path, patch: &str, target: PatchTarget) -> Result<(), GitError> {
+    let mut args = vec!["apply", "--recount", "--whitespace=nowarn"];
+    match target {
+        PatchTarget::Stage => args.push("--cached"),
+        PatchTarget::Unstage => args.extend(["--cached", "--reverse"]),
+        PatchTarget::Discard => args.push("--reverse"),
+    }
+    args.push("-");
+    run_with_input(repo, &args, Some(patch.as_bytes())).map(drop)
+}
+
 /// Commits the index with `message` (hooks run as usual). `amend` replaces HEAD.
 pub fn commit(repo: &Path, message: &str, amend: bool) -> Result<(), GitError> {
     let mut args = vec!["commit", "--cleanup=strip", "-F", "-"];
@@ -1010,6 +1034,160 @@ mod tests {
         );
         checkout(d, "main").unwrap();
         assert_eq!(checkout_remote(d, "origin/feature/z").unwrap(), "feature/z");
+    }
+
+    /// Randomised check of line-level stage / unstage / discard against real git: every
+    /// result must equal the file computed independently from a full-context diff.
+    #[test]
+    fn partial_patches_apply_exactly() {
+        use spork_patch::{FilePatch, Kind};
+
+        let mut seed: u64 = 0x5eed;
+        let mut rand = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        // selection is a function of the line text, so it is identical in -U3 and full diffs
+        let pick = |salt: u64, raw: &str| {
+            let h = raw
+                .bytes()
+                .fold(salt, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+            h % 3 != 0
+        };
+        // expected file content after keeping `keep(kind, picked)` lines of a full-context diff
+        let expected = |full: &str, salt: u64, keep: &dyn Fn(Kind, bool) -> bool| -> String {
+            let patch = FilePatch::parse(full).unwrap();
+            let lines: Vec<_> = patch.lines().collect();
+            let mut out = String::new();
+            for (i, l) in lines.iter().enumerate() {
+                if l.kind == Kind::NoNewline || !keep(l.kind, pick(salt, &l.raw)) {
+                    continue;
+                }
+                let text = &l.raw[1..];
+                // a following "\ No newline" marker means this file line has no line ending
+                let no_eol = lines.get(i + 1).is_some_and(|n| n.kind == Kind::NoNewline);
+                out.push_str(if no_eol {
+                    text.trim_end_matches('\n')
+                } else {
+                    text
+                });
+            }
+            out
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        let read_index =
+            |d: &Path| String::from_utf8(run(d, &["show", ":f.txt"]).unwrap()).unwrap();
+        let unstaged =
+            |d: &Path| String::from_utf8(run(d, &["diff", "--", "f.txt"]).unwrap()).unwrap();
+        let staged = |d: &Path| {
+            String::from_utf8(run(d, &["diff", "--cached", "--", "f.txt"]).unwrap()).unwrap()
+        };
+        let full = |d: &Path, cached: bool| {
+            let args: &[&str] = if cached {
+                &["diff", "--cached", "-U100000", "--", "f.txt"]
+            } else {
+                &["diff", "-U100000", "--", "f.txt"]
+            };
+            String::from_utf8(run(d, args).unwrap()).unwrap()
+        };
+
+        let mut applied = 0;
+        for round in 0..150u64 {
+            // random base and random edit of it
+            let lines = 5 + rand(40) as usize;
+            let mut base: String = (0..lines).map(|i| format!("line {i} r{round}\n")).collect();
+            let mut new = String::new();
+            for (i, l) in base.lines().enumerate() {
+                match rand(10) {
+                    0 => {}
+                    1 => new.push_str(&format!("line {i} changed r{round}\n")),
+                    2 => new.push_str(&format!("{l}\ninserted {i} r{round}\n")),
+                    _ => new.push_str(&format!("{l}\n")),
+                }
+            }
+            if rand(4) == 0 {
+                new.push_str(&format!("tail r{round}"));
+            } // no trailing newline
+            if rand(6) == 0 {
+                base.pop();
+            } // base without trailing newline
+            if new == base {
+                continue;
+            }
+            std::fs::write(d.join("f.txt"), &base).unwrap();
+            git(d, &["add", "f.txt"]);
+            git(d, &["commit", "-q", "--allow-empty", "-m", "base"]);
+            std::fs::write(d.join("f.txt"), &new).unwrap();
+            let edge_case = !base.ends_with('\n') || !new.ends_with('\n');
+            let salt = round;
+
+            // 1. stage a selection: index = base + picked changes
+            let patch = FilePatch::parse(&unstaged(d)).unwrap();
+            let want = expected(&full(d, false), salt, &|k, p| match k {
+                Kind::Removed => !p,
+                Kind::Added => p,
+                _ => true,
+            });
+            if let Some(partial) = patch.partial(|_, l| pick(salt, &l.raw), false) {
+                let before = read_index(d);
+                match apply_patch(d, &partial, PatchTarget::Stage) {
+                    Ok(()) => {
+                        assert_eq!(read_index(d), want, "stage, round {round}\n{partial}");
+                        applied += 1;
+                    }
+                    Err(e) => {
+                        assert!(edge_case, "stage rejected, round {round}: {e}\n{partial}");
+                        assert_eq!(read_index(d), before, "rejected patch changed the index");
+                    }
+                }
+            }
+
+            // 2. stage everything, then unstage a selection: index = new minus picked changes
+            stage(d, &["f.txt"]).unwrap();
+            let patch = FilePatch::parse(&staged(d)).unwrap();
+            let want = expected(&full(d, true), salt, &|k, p| match k {
+                Kind::Removed => p,
+                Kind::Added => !p,
+                _ => true,
+            });
+            if let Some(partial) = patch.partial(|_, l| pick(salt, &l.raw), true) {
+                let before = read_index(d);
+                match apply_patch(d, &partial, PatchTarget::Unstage) {
+                    Ok(()) => assert_eq!(read_index(d), want, "unstage, round {round}\n{partial}"),
+                    Err(e) => {
+                        assert!(edge_case, "unstage rejected, round {round}: {e}\n{partial}");
+                        assert_eq!(read_index(d), before);
+                    }
+                }
+            }
+
+            // 3. reset the index to base, then discard a selection from the work tree
+            unstage(d, &["f.txt"]).unwrap();
+            let patch = FilePatch::parse(&unstaged(d)).unwrap();
+            let want = expected(&full(d, false), salt, &|k, p| match k {
+                Kind::Removed => p,
+                Kind::Added => !p,
+                _ => true,
+            });
+            if let Some(partial) = patch.partial(|_, l| pick(salt, &l.raw), true) {
+                match apply_patch(d, &partial, PatchTarget::Discard) {
+                    Ok(()) => assert_eq!(
+                        std::fs::read_to_string(d.join("f.txt")).unwrap(),
+                        want,
+                        "discard, round {round}"
+                    ),
+                    Err(e) => {
+                        assert!(edge_case, "discard rejected, round {round}: {e}\n{partial}");
+                        assert_eq!(std::fs::read_to_string(d.join("f.txt")).unwrap(), new);
+                    }
+                }
+            }
+        }
+        assert!(applied > 100, "too few rounds exercised: {applied}");
     }
 
     #[test]

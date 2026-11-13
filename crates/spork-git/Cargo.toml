@@ -11,3 +11,4 @@ trash = "5"
 
 [dev-dependencies]
 tempfile = "3"
+spork-patch = { path = "../spork-patch" }
