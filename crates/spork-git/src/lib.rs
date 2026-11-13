@@ -832,6 +832,51 @@ pub fn interactive_rebase(
     allow_conflicts(repo, result)
 }
 
+/// Default folder name for a clone: `https://host/org/spork.git` → `spork`, `git@host:org/x` → `x`.
+pub fn repo_name_from_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let last = trimmed.rsplit(['/', ':', '\\']).next().unwrap_or(trimmed);
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    if name.is_empty() {
+        "repository".into()
+    } else {
+        name.into()
+    }
+}
+
+/// Clones `url` into `parent/name` with submodules (docs/specs/M02 §1). Refuses to touch an
+/// existing non-empty folder. Returns the new repository's path.
+pub fn clone(url: &str, parent: &Path, name: &str) -> Result<PathBuf, GitError> {
+    let dest = parent.join(name);
+    let busy = std::fs::read_dir(&dest).is_ok_and(|mut entries| entries.next().is_some());
+    if busy {
+        return Err(GitError::Other {
+            code: None,
+            stderr: format!("{} already exists and isn't empty.", dest.display()),
+        });
+    }
+    run(
+        parent,
+        &["clone", "--recurse-submodules", "--", url.trim(), name],
+    )?;
+    Ok(dest)
+}
+
+/// Creates a new repository in `path` (made if missing). Uses `init.defaultBranch`, else `main`.
+pub fn init(path: &Path) -> Result<(), GitError> {
+    std::fs::create_dir_all(path).map_err(|e| GitError::Other {
+        code: None,
+        stderr: e.to_string(),
+    })?;
+    let has_default = run(path, &["config", "--get", "init.defaultBranch"]).is_ok();
+    let args: &[&str] = if has_default {
+        &["init", "--quiet"]
+    } else {
+        &["init", "--quiet", "--initial-branch=main"]
+    };
+    run(path, args).map(drop)
+}
+
 /// Where a partial patch from `spork-patch` is applied (docs/specs/M07 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchTarget {
@@ -1949,6 +1994,29 @@ mod tests {
         let all_dropped = vec![(log(d, 1).unwrap()[0].id.clone(), TodoAction::Drop)];
         assert!(interactive_rebase(d, "HEAD~1", &all_dropped).is_err());
         assert_eq!(op_state(d).unwrap(), OpState::None);
+    }
+
+    #[test]
+    fn clone_init_and_names() {
+        assert_eq!(
+            repo_name_from_url("https://github.com/medmdime/Spork.git"),
+            "Spork"
+        );
+        assert_eq!(repo_name_from_url("git@github.com:org/tool"), "tool");
+        assert_eq!(repo_name_from_url("/srv/git/project.git/"), "project");
+        assert_eq!(repo_name_from_url(""), "repository");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        init(&origin).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "hello"]);
+        assert!(head_branch(&origin).unwrap().is_some());
+
+        let dest = clone(origin.to_str().unwrap(), tmp.path(), "copy").unwrap();
+        assert_eq!(head_message(&dest).as_deref(), Some("hello"));
+        // never clone over an existing non-empty folder
+        let err = clone(origin.to_str().unwrap(), tmp.path(), "copy").unwrap_err();
+        assert!(err.to_string().contains("isn't empty"));
     }
 
     #[test]

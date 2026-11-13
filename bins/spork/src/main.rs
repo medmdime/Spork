@@ -6,6 +6,7 @@ mod changes;
 mod history;
 mod operations;
 mod rebase;
+mod repos;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -67,6 +68,9 @@ struct RepoView {
     stash_message: Entity<InputState>,
     stash_untracked: bool,
     rebase_plan: Option<rebase::RebasePlan>,
+    /// Recently opened repositories (repos.rs).
+    recent: Vec<PathBuf>,
+    clone_url: Entity<InputState>,
     tag_name: Entity<InputState>,
     tag_message: Entity<InputState>,
     _prompts: Option<Task<()>>,
@@ -133,6 +137,10 @@ impl RepoView {
                 .new(|cx| InputState::new(window, cx).placeholder("Message (optional)")),
             stash_untracked: true,
             rebase_plan: None,
+            recent: repos::recent(),
+            clone_url: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("https://github.com/org/repo.git")
+            }),
             tag_name: cx.new(|cx| InputState::new(window, cx).placeholder("v1.2.0")),
             tag_message: cx.new(|cx| InputState::new(window, cx).placeholder("Message (optional)")),
             _prompts: prompts.map(|rx| {
@@ -162,6 +170,10 @@ impl RepoView {
             this.update(cx, |this, cx| {
                 // keep the same commit selected even if new commits shifted the rows
                 let selected_id = this.selected_commit_id();
+                if let Ok(repo) = &loaded {
+                    repos::remember(&repo.root);
+                    this.recent = repos::recent();
+                }
                 this.repo = Some(loaded);
                 if let Some(Ok(repo)) = &this.repo {
                     let root = repo.root.clone();
@@ -411,18 +423,11 @@ impl RepoView {
             None => return base.child(centered("Loading repository…".into())),
             Some(Ok(repo)) => repo,
             Some(Err(e)) => {
-                return base.justify_center().child(
-                    v_flex()
-                        .gap_3()
-                        .items_center()
-                        .child(div().text_lg().child(e.to_string()))
-                        .child(div().text_sm().child(self.requested.display().to_string()))
-                        .child(
-                            Button::new("retry")
-                                .label("Try again")
-                                .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
-                        ),
-                );
+                let problem = match e {
+                    GitError::NotARepo => None,
+                    other => Some(format!("{}: {other}", self.requested.display())),
+                };
+                return base.child(self.welcome(problem, cx));
             }
         };
 
@@ -462,7 +467,7 @@ impl RepoView {
                     .justify_between()
                     .child(
                         v_flex()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+                            .child(self.repo_switcher(name, cx))
                             .child(div().text_xs().child(head)),
                     )
                     .child(
