@@ -86,8 +86,8 @@ pub fn run_with_input(
         .env("LC_ALL", "C")
         // reads must not take the index lock behind the user's back
         .env("GIT_OPTIONAL_LOCKS", "0")
-        // paths are always literal: a file named `*.rs` or `:x` is never a pattern
-        .env("GIT_LITERAL_PATHSPECS", "1")
+        // never wait for an editor nobody sees: Spork always passes messages explicitly
+        .env("GIT_EDITOR", "true")
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -447,6 +447,12 @@ pub fn unstage(repo: &Path, paths: &[&str]) -> Result<(), GitError> {
     }
 }
 
+/// Pathspec that matches exactly `path`: a file named `*.rs` or `:x` is never a pattern.
+/// (Per path, not `GIT_LITERAL_PATHSPECS`, which breaks `git stash --include-untracked`.)
+fn literal(path: &str) -> String {
+    format!(":(literal){path}")
+}
+
 /// Runs `git <args> --pathspec-from-file=-` with NUL-separated paths on stdin (no argv length limits).
 fn with_pathspecs(repo: &Path, args: &[&str], paths: &[&str]) -> Result<(), GitError> {
     if paths.is_empty() {
@@ -454,7 +460,7 @@ fn with_pathspecs(repo: &Path, args: &[&str], paths: &[&str]) -> Result<(), GitE
     }
     let mut input = Vec::new();
     for p in paths {
-        input.extend_from_slice(p.as_bytes());
+        input.extend_from_slice(literal(p).as_bytes());
         input.push(0);
     }
     let args = [args, &["--pathspec-from-file=-", "--pathspec-file-nul"]].concat();
@@ -482,6 +488,206 @@ pub fn discard(repo: &Path, entries: &[StatusEntry]) -> Result<(), GitError> {
         })?;
     }
     Ok(())
+}
+
+/// A multi-step operation git has paused, usually on conflicts (docs/specs/M11 §0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpState {
+    None,
+    Merging,
+    Rebasing { step: usize, total: usize },
+    CherryPicking,
+    Reverting,
+}
+
+pub fn op_state(repo: &Path) -> Result<OpState, GitError> {
+    let git_dir = PathBuf::from(
+        String::from_utf8_lossy(&run(repo, &["rev-parse", "--absolute-git-dir"])?).trim_end(),
+    );
+    let num = |dir: &str, file: &str| {
+        std::fs::read_to_string(git_dir.join(dir).join(file))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    Ok(if git_dir.join("rebase-merge").is_dir() {
+        OpState::Rebasing {
+            step: num("rebase-merge", "msgnum"),
+            total: num("rebase-merge", "end"),
+        }
+    } else if git_dir.join("rebase-apply").is_dir() {
+        OpState::Rebasing {
+            step: num("rebase-apply", "next"),
+            total: num("rebase-apply", "last"),
+        }
+    } else if git_dir.join("MERGE_HEAD").is_file() {
+        OpState::Merging
+    } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
+        OpState::CherryPicking
+    } else if git_dir.join("REVERT_HEAD").is_file() {
+        OpState::Reverting
+    } else {
+        OpState::None
+    })
+}
+
+/// How an operation that can stop on conflicts ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Done,
+    /// Paused with conflicts to resolve; then continue or abort.
+    Conflicts,
+}
+
+/// Turns "git stopped because of conflicts" into `Outcome::Conflicts` instead of an error.
+fn allow_conflicts(repo: &Path, result: Result<Vec<u8>, GitError>) -> Result<Outcome, GitError> {
+    match result {
+        Ok(_) => Ok(Outcome::Done),
+        Err(e) => {
+            let conflicted = status(repo).is_ok_and(|st| st.iter().any(|e| e.conflicted));
+            if conflicted {
+                Ok(Outcome::Conflicts)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn is_merge_commit(repo: &Path, commit: &str) -> bool {
+    run(
+        repo,
+        &["rev-parse", "--verify", "--quiet", &format!("{commit}^2")],
+    )
+    .is_ok()
+}
+
+/// Merges `branch` into the current branch (M11 §1). Fast-forwards when possible.
+pub fn merge(repo: &Path, branch: &str) -> Result<Outcome, GitError> {
+    allow_conflicts(repo, run(repo, &["merge", "--no-edit", branch]))
+}
+
+/// Rebases the current branch onto `onto`, stashing and restoring local changes (M11 §2).
+pub fn rebase(repo: &Path, onto: &str) -> Result<Outcome, GitError> {
+    allow_conflicts(repo, run(repo, &["rebase", "--autostash", onto]))
+}
+
+/// Applies one commit on top of HEAD (M06). Merge commits are picked against their first parent.
+pub fn cherry_pick(repo: &Path, commit: &str) -> Result<Outcome, GitError> {
+    let mut args = vec!["cherry-pick"];
+    if is_merge_commit(repo, commit) {
+        args.extend(["-m", "1"]);
+    }
+    args.push(commit);
+    allow_conflicts(repo, run(repo, &args))
+}
+
+/// Creates a commit undoing `commit` (M06). Merge commits are reverted against their first parent.
+pub fn revert(repo: &Path, commit: &str) -> Result<Outcome, GitError> {
+    let mut args = vec!["revert", "--no-edit"];
+    if is_merge_commit(repo, commit) {
+        args.extend(["-m", "1"]);
+    }
+    args.push(commit);
+    allow_conflicts(repo, run(repo, &args))
+}
+
+fn op_command(state: OpState) -> Option<&'static str> {
+    match state {
+        OpState::None => None,
+        OpState::Merging => Some("merge"),
+        OpState::Rebasing { .. } => Some("rebase"),
+        OpState::CherryPicking => Some("cherry-pick"),
+        OpState::Reverting => Some("revert"),
+    }
+}
+
+/// Continues the paused operation once conflicts are resolved and staged.
+pub fn continue_op(repo: &Path) -> Result<Outcome, GitError> {
+    let Some(cmd) = op_command(op_state(repo)?) else {
+        return Ok(Outcome::Done);
+    };
+    allow_conflicts(repo, run(repo, &[cmd, "--continue"]))
+}
+
+/// Skips the current commit of a rebase / cherry-pick / revert.
+pub fn skip_op(repo: &Path) -> Result<Outcome, GitError> {
+    let Some(cmd) = op_command(op_state(repo)?) else {
+        return Ok(Outcome::Done);
+    };
+    allow_conflicts(repo, run(repo, &[cmd, "--skip"]))
+}
+
+/// Abandons the paused operation and restores the state from before it started.
+pub fn abort_op(repo: &Path) -> Result<(), GitError> {
+    let Some(cmd) = op_command(op_state(repo)?) else {
+        return Ok(());
+    };
+    run(repo, &[cmd, "--abort"]).map(drop)
+}
+
+/// Resolves a conflicted file by taking one side whole (M11 §4), then marks it resolved.
+/// `ours` is the current branch's side (during a rebase: the branch being rebased onto).
+pub fn resolve_with(repo: &Path, path: &str, ours: bool) -> Result<(), GitError> {
+    let side = if ours { "--ours" } else { "--theirs" };
+    let spec = &literal(path);
+    match run(repo, &["checkout", side, "--", spec]) {
+        Ok(_) => stage(repo, &[path]),
+        // the chosen side deleted the file
+        Err(_) => run(repo, &["rm", "--quiet", "--", spec]).map(drop),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stash {
+    /// Position in `git stash list`, as in `stash@{index}`.
+    pub index: usize,
+    pub id: String,
+    pub message: String,
+    pub time: i64,
+}
+
+/// Saved stashes, newest first (docs/specs/M12 §1).
+pub fn stashes(repo: &Path) -> Result<Vec<Stash>, GitError> {
+    let out = run(repo, &["stash", "list", "--format=%H%x1f%gs%x1f%ct"])?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let mut f = line.split('\x1f');
+            Some(Stash {
+                index,
+                id: f.next()?.to_owned(),
+                message: f.next()?.to_owned(),
+                time: f.next()?.parse().ok()?,
+            })
+        })
+        .collect())
+}
+
+/// Stashes local changes (untracked files too when asked). Empty message = git's default.
+pub fn stash_save(repo: &Path, message: &str, include_untracked: bool) -> Result<(), GitError> {
+    let mut args = vec!["stash", "push"];
+    if include_untracked {
+        args.push("--include-untracked");
+    }
+    if !message.trim().is_empty() {
+        args.extend(["--message", message.trim()]);
+    }
+    run(repo, &args).map(drop)
+}
+
+/// Applies a stash; `pop` also drops it, except when it conflicts (git keeps it then).
+pub fn stash_apply(repo: &Path, index: usize, pop: bool) -> Result<Outcome, GitError> {
+    let name = format!("stash@{{{index}}}");
+    allow_conflicts(
+        repo,
+        run(repo, &["stash", if pop { "pop" } else { "apply" }, &name]),
+    )
+}
+
+pub fn stash_drop(repo: &Path, index: usize) -> Result<(), GitError> {
+    run(repo, &["stash", "drop", &format!("stash@{{{index}}}")]).map(drop)
 }
 
 /// Where a partial patch from `spork-patch` is applied (docs/specs/M07 §4).
@@ -527,8 +733,9 @@ pub fn head_message(repo: &Path) -> Option<String> {
 pub fn file_diff(repo: &Path, entry: &StatusEntry, staged: bool) -> Result<String, GitError> {
     let base = ["diff", "--no-color", "--no-ext-diff", "--find-renames"];
     let out = if staged {
-        let mut paths = vec![entry.path.as_str()];
-        paths.extend(entry.orig_path.as_deref());
+        let mut paths = vec![literal(&entry.path)];
+        paths.extend(entry.orig_path.as_deref().map(literal));
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
         run(repo, &[&base[..], &["--cached", "--"], &paths].concat())?
     } else if entry.untracked() {
         run_allowing_diff(
@@ -536,7 +743,7 @@ pub fn file_diff(repo: &Path, entry: &StatusEntry, staged: bool) -> Result<Strin
             &[&base[..], &["--no-index", "--", NULL_DEVICE, &entry.path]].concat(),
         )?
     } else {
-        run(repo, &[&base[..], &["--", &entry.path]].concat())?
+        run(repo, &[&base[..], &["--", &literal(&entry.path)]].concat())?
     };
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
@@ -1361,6 +1568,118 @@ mod tests {
             }
         }
         assert!(applied > 100, "too few rounds exercised: {applied}");
+    }
+
+    #[test]
+    fn merge_rebase_pick_revert_with_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let write = |c: &str| std::fs::write(d.join("f.txt"), c).unwrap();
+        let read = || std::fs::read_to_string(d.join("f.txt")).unwrap();
+        git(d, &["init", "-q", "-b", "main"]);
+        write("base\n");
+        git(d, &["add", "f.txt"]);
+        git(d, &["commit", "-q", "-m", "base"]);
+        git(d, &["switch", "-q", "-c", "feature"]);
+        write("feature\n");
+        git(d, &["commit", "-q", "-am", "feature edit"]);
+        git(d, &["switch", "-q", "main"]);
+        write("main\n");
+        git(d, &["commit", "-q", "-am", "main edit"]);
+        assert_eq!(op_state(d).unwrap(), OpState::None);
+
+        // merge → conflict → abort restores main
+        assert_eq!(merge(d, "feature").unwrap(), Outcome::Conflicts);
+        assert_eq!(op_state(d).unwrap(), OpState::Merging);
+        abort_op(d).unwrap();
+        assert_eq!(
+            (op_state(d).unwrap(), read()),
+            (OpState::None, "main\n".into())
+        );
+
+        // merge → conflict → take theirs → continue creates the merge commit
+        merge(d, "feature").unwrap();
+        resolve_with(d, "f.txt", false).unwrap();
+        assert!(!status(d).unwrap().iter().any(|e| e.conflicted));
+        assert_eq!(continue_op(d).unwrap(), Outcome::Done);
+        assert_eq!(
+            (op_state(d).unwrap(), read()),
+            (OpState::None, "feature\n".into())
+        );
+        assert_eq!(log(d, 1).unwrap()[0].parents.len(), 2);
+
+        // rebase with conflicts reports progress; resolve with ours and continue
+        git(d, &["switch", "-q", "-c", "topic", "HEAD~1"]); // main before the merge
+        write("topic\n");
+        git(d, &["commit", "-q", "-am", "topic edit"]);
+        assert_eq!(rebase(d, "feature").unwrap(), Outcome::Conflicts);
+        assert_eq!(
+            op_state(d).unwrap(),
+            OpState::Rebasing { step: 1, total: 2 }
+        );
+        resolve_with(d, "f.txt", true).unwrap(); // during a rebase "ours" = feature
+        assert_eq!(continue_op(d).unwrap(), Outcome::Conflicts); // next commit conflicts too
+        assert_eq!(skip_op(d).unwrap(), Outcome::Done);
+        assert_eq!(op_state(d).unwrap(), OpState::None);
+
+        // cherry-pick cleanly, then revert it
+        git(d, &["switch", "-q", "main"]);
+        std::fs::write(d.join("g.txt"), "g\n").unwrap();
+        git(d, &["add", "g.txt"]);
+        git(d, &["commit", "-q", "-m", "add g"]);
+        let g = log(d, 1).unwrap()[0].id.clone();
+        git(d, &["switch", "-q", "topic"]);
+        assert_eq!(cherry_pick(d, &g).unwrap(), Outcome::Done);
+        assert!(d.join("g.txt").exists());
+        assert_eq!(revert(d, "HEAD").unwrap(), Outcome::Done);
+        assert!(!d.join("g.txt").exists());
+        // a merge commit is picked against its first parent instead of failing
+        git(d, &["switch", "-q", "main"]);
+        let merge_commit = log(d, 10)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.parents.len() == 2)
+            .unwrap()
+            .id;
+        git(d, &["switch", "-q", "-c", "picker", "HEAD~3"]);
+        assert!(cherry_pick(d, &merge_commit).is_ok());
+    }
+
+    #[test]
+    fn stash_save_apply_pop_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        std::fs::write(d.join("f.txt"), "one\n").unwrap();
+        git(d, &["add", "f.txt"]);
+        git(d, &["commit", "-q", "-m", "base"]);
+        assert!(stashes(d).unwrap().is_empty());
+
+        std::fs::write(d.join("f.txt"), "two\n").unwrap();
+        std::fs::write(d.join("new.txt"), "n\n").unwrap();
+        stash_save(d, "wip: two", true).unwrap();
+        let st = status(d).unwrap();
+        assert!(st.is_empty(), "{st:?}"); // untracked file went into the stash too
+        std::fs::write(d.join("f.txt"), "three\n").unwrap();
+        stash_save(d, "", false).unwrap();
+        let list = stashes(d).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].message, "On main: wip: two");
+        assert!(list[0].message.starts_with("WIP on main"));
+
+        // apply keeps the stash, pop removes it
+        assert_eq!(stash_apply(d, 1, false).unwrap(), Outcome::Done);
+        assert_eq!(std::fs::read_to_string(d.join("f.txt")).unwrap(), "two\n");
+        assert_eq!(stashes(d).unwrap().len(), 2);
+        // uncommitted changes to the same file block applying the other stash; nothing is lost
+        assert!(stash_apply(d, 0, true).is_err());
+        assert_eq!(stashes(d).unwrap().len(), 2);
+        git(d, &["checkout", "--", "f.txt"]);
+        std::fs::remove_file(d.join("new.txt")).unwrap();
+        assert_eq!(stash_apply(d, 0, true).unwrap(), Outcome::Done);
+        assert_eq!(stashes(d).unwrap().len(), 1);
+        stash_drop(d, 0).unwrap();
+        assert!(stashes(d).unwrap().is_empty());
     }
 
     #[test]
