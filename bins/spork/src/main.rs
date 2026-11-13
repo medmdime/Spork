@@ -4,7 +4,7 @@ mod history;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -30,6 +30,8 @@ struct RepoView {
     diff: Entity<DiffState>,
     _load: Option<Task<()>>,
     _details_load: Option<Task<()>>,
+    /// Watches the repository so external changes (terminal, IDE) show up without Refresh.
+    _watcher: Option<(notify::RecommendedWatcher, Task<()>)>,
     _appearance: Subscription,
 }
 
@@ -54,6 +56,7 @@ impl RepoView {
             diff: cx.new(|cx| DiffState::new([], cx)),
             _load: None,
             _details_load: None,
+            _watcher: None,
             _appearance,
         };
         view.reload(cx);
@@ -66,11 +69,67 @@ impl RepoView {
         self._load = Some(cx.spawn(async move |this, cx| {
             let loaded = cx.background_spawn(async move { load(&path) }).await;
             this.update(cx, |this, cx| {
+                // keep the same commit selected even if new commits shifted the rows
+                let selected_id = this.selected_commit_id();
                 this.repo = Some(loaded);
+                if let Some(Ok(repo)) = &this.repo {
+                    let root = repo.root.clone();
+                    let ix = selected_id
+                        .and_then(|id| repo.history.commits.iter().position(|c| c.id == id));
+                    if ix.is_none() {
+                        this.selected = None;
+                        this.details = None;
+                    }
+                    this.selected = ix;
+                    if this._watcher.is_none() {
+                        this.watch(root, cx);
+                    }
+                }
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    fn selected_commit_id(&self) -> Option<String> {
+        let Some(Ok(repo)) = &self.repo else {
+            return None;
+        };
+        Some(repo.history.commits.get(self.selected?)?.id.clone())
+    }
+
+    /// Reloads when files in the work tree or `.git` change, after 300 ms of quiet (one reload per burst).
+    // shortcut: any change reloads everything; split refs / index / work-tree refreshes when status lands (P2).
+    fn watch(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        use notify::{EventKind, RecursiveMode, Watcher as _};
+        let (tx, rx) = smol::channel::unbounded::<()>();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            // reading files (including our own git reads) must not trigger reloads
+            if event.is_ok_and(|e| !matches!(e.kind, EventKind::Access(_))) {
+                tx.try_send(()).ok();
+            }
+        });
+        let Ok(mut watcher) = watcher else { return };
+        if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            while rx.recv().await.is_ok() {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                    if rx.is_empty() {
+                        break;
+                    }
+                    while rx.try_recv().is_ok() {}
+                }
+                if this.update(cx, |this, cx| this.reload(cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        self._watcher = Some((watcher, task));
     }
 }
 

@@ -5947,6 +5947,8 @@ name = "spork"
 version = "0.0.1"
 dependencies = [
  "gpui-kit",
+ "notify",
+ "smol",
  "spork-git",
  "spork-graph",
 ]
