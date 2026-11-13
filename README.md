@@ -7,8 +7,8 @@ polished desktop clients like Fork and GitKraken offer (a clear commit graph, pa
 editing) but want it open, cross-platform, and owned by its community instead of a license key.
 
 > 🚧 **Spork is in early development.** It isn't ready for daily use yet. Today it opens a repository, shows its
-> branches, remotes and tags, draws the full commit graph with commit details and diffs, refreshes itself, and lets
-> you stage files and commit. Everything else below is being built in the open, step by step. Star or watch the repo to follow along, and see [Status & roadmap](#status--roadmap).
+> branches, remotes and tags, draws the full commit graph with commit details and diffs, refreshes itself, stages
+> files or single lines, commits, pushes, merges, rebases (also interactively) and resolves conflicts. Everything else below is being built in the open, step by step. Star or watch the repo to follow along, and see [Status & roadmap](#status--roadmap).
 
 ## What Spork is
 
@@ -65,8 +65,8 @@ behaviour predictable and testable without a window. Details: [docs/00-overview.
 | P0 Foundations | git runner, error handling, repo view with branches/remotes/tags, themes, auto-refresh, CI on 3 OSes | ✓ done |
 | **P1 Read-only client** | commit graph ✓, commit details ✓, diffs ✓, blame, file history, search | **in progress** |
 | P2 Daily driver | staging incl. single lines ✓, discard ✓, commit ✓, amend ✓, fetch/pull/push ✓, branches ✓, password prompts ✓ | ✓ done |
-| **P3 History editing** | merge, rebase, interactive rebase, conflict resolver, cherry-pick, stash, tags | **next** |
-| P4 Breadth | clone, submodules, worktrees, git-flow, LFS, image diffs, workspaces | |
+| P3 History editing | merge ✓, rebase ✓, interactive rebase ✓, 3-way conflict resolver ✓, cherry-pick ✓, revert ✓, stashes ✓, tags ✓ | ✓ done |
+| **P4 Breadth** | clone, submodules, worktrees, git-flow, LFS, image diffs, workspaces | **next** |
 | P5 Integrations | hosting accounts & pull requests, custom commands, statistics | |
 | P6 AI | the optional AI features above | |
 | P7 1.0 | installers for every OS, auto-update, docs site | |

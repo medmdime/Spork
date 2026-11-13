@@ -78,6 +78,16 @@ pub fn run_with_input(
     args: &[&str],
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>, GitError> {
+    run_with_env(repo, args, input, &[])
+}
+
+/// Like [`run_with_input`], with extra environment variables for this one command.
+fn run_with_env(
+    repo: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+    env: &[(&str, &str)],
+) -> Result<Vec<u8>, GitError> {
     let mut cmd = Command::new(git_binary());
     cmd.args(["-c", "core.quotepath=false", "-c", "color.ui=false"])
         .args(args)
@@ -101,6 +111,7 @@ pub fn run_with_input(
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     askpass::configure(&mut cmd);
+    cmd.envs(env.iter().copied());
     let mut child = cmd
         .spawn()
         .map_err(|e| GitError::GitMissing(e.to_string()))?;
@@ -736,6 +747,89 @@ pub fn push_tag(repo: &Path, name: &str) -> Result<String, GitError> {
     };
     run(repo, &["push", remote, &format!("refs/tags/{name}")])?;
     Ok(remote.to_owned())
+}
+
+/// What to do with one commit in an interactive rebase (docs/specs/M11 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoAction {
+    Pick,
+    /// Meld into the previous commit, keeping both messages.
+    Squash,
+    /// Meld into the previous commit, dropping this message.
+    Fixup,
+    Drop,
+}
+
+/// Commits after `base` up to HEAD, oldest first: the rows of the interactive rebase editor.
+pub fn rebase_range(repo: &Path, base: &str) -> Result<Vec<Commit>, GitError> {
+    let range = format!("{base}..HEAD");
+    let out = run(
+        repo,
+        &[
+            "log",
+            "-z",
+            "--reverse",
+            "--topo-order",
+            LOG_FORMAT,
+            &range,
+            "--",
+        ],
+    )?;
+    let commits = parse_log(&String::from_utf8_lossy(&out));
+    if commits.iter().any(|c| c.parents.len() > 1) {
+        return Err(GitError::Other {
+            code: None,
+            stderr: "This range contains merge commits; interactive rebase would flatten them."
+                .into(),
+        });
+    }
+    Ok(commits)
+}
+
+/// Rewrites the commits after `base` following `plan` (in the new order). Git does the work:
+/// the plan is written as git's todo list and copied in by `GIT_SEQUENCE_EDITOR`.
+pub fn interactive_rebase(
+    repo: &Path,
+    base: &str,
+    plan: &[(String, TodoAction)],
+) -> Result<Outcome, GitError> {
+    let fail = |msg: &str| GitError::Other {
+        code: None,
+        stderr: msg.to_owned(),
+    };
+    match plan.iter().find(|(_, a)| *a != TodoAction::Drop) {
+        None => return Err(fail("Every commit would be dropped; use Reset instead.")),
+        Some((_, TodoAction::Squash | TodoAction::Fixup)) => {
+            return Err(fail(
+                "The first kept commit can't be squashed or fixed up: there is nothing before it.",
+            ));
+        }
+        _ => {}
+    }
+    let todo: String = plan
+        .iter()
+        .map(|(id, action)| {
+            let verb = match action {
+                TodoAction::Pick => "pick",
+                TodoAction::Squash => "squash",
+                TodoAction::Fixup => "fixup",
+                TodoAction::Drop => "drop",
+            };
+            format!("{verb} {id}\n")
+        })
+        .collect();
+    let file = std::env::temp_dir().join(format!("spork-rebase-todo-{}", askpass::random_token()));
+    std::fs::write(&file, todo).map_err(|e| fail(&e.to_string()))?;
+    // the editor command runs in git's shell with the todo path appended: `cp <ours> <git's>`
+    let editor = format!("cp '{}'", file.display().to_string().replace('\'', "'\\''"));
+    let result = run_with_env(
+        repo,
+        &["rebase", "--interactive", "--autostash", base],
+        None,
+        &[("GIT_SEQUENCE_EDITOR", &editor)],
+    );
+    std::fs::remove_file(&file).ok();
+    allow_conflicts(repo, result)
 }
 
 /// Where a partial patch from `spork-patch` is applied (docs/specs/M07 §4).
@@ -1787,6 +1881,74 @@ mod tests {
 
         delete_tag(&d, "v1.0").unwrap();
         assert!(!refs(&d).unwrap().iter().any(|r| r.name == "v1.0"));
+    }
+
+    #[test]
+    fn interactive_rebase_reorders_squashes_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        for (i, name) in ["base", "a", "b", "c", "d"].iter().enumerate() {
+            std::fs::write(d.join(format!("{name}.txt")), format!("{i}\n")).unwrap();
+            git(d, &["add", "."]);
+            git(d, &["commit", "-q", "-m", name]);
+        }
+        let subjects = |d: &Path| {
+            log(d, 20)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.subject)
+                .collect::<Vec<_>>()
+        };
+        let range = rebase_range(d, "HEAD~4").unwrap();
+        assert_eq!(
+            range.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
+        let id = |s: &str| range.iter().find(|c| c.subject == s).unwrap().id.clone();
+
+        // reorder d first, squash b into it... keep a, fixup c into a, drop nothing
+        let plan = vec![
+            (id("d"), TodoAction::Pick),
+            (id("b"), TodoAction::Squash),
+            (id("a"), TodoAction::Pick),
+            (id("c"), TodoAction::Fixup),
+        ];
+        assert_eq!(
+            interactive_rebase(d, "HEAD~4", &plan).unwrap(),
+            Outcome::Done
+        );
+        assert_eq!(subjects(d), ["a", "d", "base"]);
+        let squashed = &log(d, 20).unwrap()[1];
+        assert!(
+            commit_details(
+                d,
+                &squashed.id,
+                squashed.parents.first().map(String::as_str)
+            )
+            .unwrap()
+            .message
+            .contains("b")
+        );
+        for f in ["a", "b", "c", "d"] {
+            assert!(d.join(format!("{f}.txt")).exists(), "{f}.txt kept");
+        }
+
+        // drop removes the commit and its file
+        let range = rebase_range(d, "HEAD~2").unwrap();
+        let plan = vec![
+            (range[0].id.clone(), TodoAction::Drop),
+            (range[1].id.clone(), TodoAction::Pick),
+        ];
+        interactive_rebase(d, "HEAD~2", &plan).unwrap();
+        assert_eq!(subjects(d), ["a", "base"]);
+
+        // guard rails
+        let only = vec![(log(d, 1).unwrap()[0].id.clone(), TodoAction::Squash)];
+        assert!(interactive_rebase(d, "HEAD~1", &only).is_err());
+        let all_dropped = vec![(log(d, 1).unwrap()[0].id.clone(), TodoAction::Drop)];
+        assert!(interactive_rebase(d, "HEAD~1", &all_dropped).is_err());
+        assert_eq!(op_state(d).unwrap(), OpState::None);
     }
 
     #[test]

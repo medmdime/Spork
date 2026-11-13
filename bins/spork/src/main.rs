@@ -5,6 +5,7 @@ mod branches;
 mod changes;
 mod history;
 mod operations;
+mod rebase;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,8 @@ const MAX_COMMITS: usize = 50_000;
 enum View {
     Changes,
     History,
+    /// Interactive rebase plan editor (rebase.rs).
+    Rebase,
 }
 
 struct RepoView {
@@ -63,6 +66,7 @@ struct RepoView {
     /// "Stash changes" dialog state (operations.rs).
     stash_message: Entity<InputState>,
     stash_untracked: bool,
+    rebase_plan: Option<rebase::RebasePlan>,
     tag_name: Entity<InputState>,
     tag_message: Entity<InputState>,
     _prompts: Option<Task<()>>,
@@ -128,6 +132,7 @@ impl RepoView {
             stash_message: cx
                 .new(|cx| InputState::new(window, cx).placeholder("Message (optional)")),
             stash_untracked: true,
+            rebase_plan: None,
             tag_name: cx.new(|cx| InputState::new(window, cx).placeholder("v1.2.0")),
             tag_message: cx.new(|cx| InputState::new(window, cx).placeholder("Message (optional)")),
             _prompts: prompts.map(|rx| {
@@ -515,6 +520,10 @@ impl RepoView {
             .overflow_hidden();
         let panel = panel.children(self.op_banner(cx));
 
+        if self.view == View::Rebase {
+            let plan = self.rebase_view(cx);
+            return base.child(sidebar).child(panel.child(plan));
+        }
         if self.view == View::Changes {
             let changes = self.changes_view(cx);
             return base.child(sidebar).child(panel.child(changes));

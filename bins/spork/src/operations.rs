@@ -222,6 +222,11 @@ impl RepoView {
             .item(item("Create tag here…", |this, id, window, cx| {
                 this.tag_dialog(id, window, cx)
             }))
+            .item(PopupMenuItem::separator())
+            .item(item(
+                "Interactive rebase from here…",
+                |this, id, window, cx| this.start_interactive_rebase(id, window, cx),
+            ))
             .item(item(&format!("Copy SHA ({short})"), |_, id, window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(id));
                 window.push_notification(Notification::info("Commit SHA copied"), cx);
