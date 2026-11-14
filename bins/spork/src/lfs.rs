@@ -817,7 +817,7 @@ impl crate::RepoView {
 }
 
 /// A unique path for `GIT_LFS_PROGRESS`; git-lfs creates the file itself.
-fn lfs_progress_file() -> PathBuf {
+pub(crate) fn lfs_progress_file() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(

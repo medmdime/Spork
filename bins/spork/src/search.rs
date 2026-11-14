@@ -516,6 +516,7 @@ impl RepoView {
             commit.id.clone(),
             commit.parents.first().cloned(),
         );
+        self.show_binary(crate::binary::BinaryPane::Search, None, cx);
         // replacing the task drops (cancels) a load for a previously clicked result
         self._search_details_load = Some(cx.spawn(async move |this, cx| {
             let details = cx
@@ -524,15 +525,21 @@ impl RepoView {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                let Some(state) = this.search.as_mut() else {
+                if this.search.is_none() {
                     return;
-                };
+                }
                 // shortcut: whole-patch parse; huge commits get a per-file lazy diff in M08
                 let files = match &details {
                     Ok(d) if d.patch.len() <= MAX_PATCH_BYTES => {
                         DiffFile::parse(&d.patch).unwrap_or_default()
                     }
                     _ => Vec::new(),
+                };
+                // a commit that only changes one binary file shows it right away (M08 §3)
+                let binary = this.binary_for_commit(&files);
+                this.show_binary(crate::binary::BinaryPane::Search, binary, cx);
+                let Some(state) = this.search.as_mut() else {
+                    return;
                 };
                 this.search_diff
                     .update(cx, |state, cx| state.set_files(files, cx));
@@ -698,6 +705,12 @@ impl RepoView {
             centered("This commit is too large to show inline.".into())
         } else if details.patch.is_empty() {
             centered("No file changes".into())
+        } else if self.binary_active(crate::binary::BinaryPane::Search, cx) {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(self.search_binary.clone())
         } else {
             // per-file "File history" and "Blame" entries in the diff header (M08 §6, M08 §5)
             let view = cx.entity();
@@ -708,6 +721,7 @@ impl RepoView {
                 commit.id.chars().take(7).collect::<String>(),
             );
             let patterns = self.lfs_patterns().to_vec();
+            let preview_patterns = patterns.clone();
             v_flex().flex_1().min_h_0().w_full().child(
                 Diff::new(&self.search_diff)
                     .size_full()
@@ -720,6 +734,15 @@ impl RepoView {
                     })
                     .render_header_suffix(move |document, window, _| {
                         let view = view.clone();
+                        // binary / LFS files open in the binary panel (M08 §3)
+                        let preview = crate::binary::preview_entry(
+                            document,
+                            &preview_patterns,
+                            &view,
+                            crate::binary::BinaryPane::Search,
+                            window,
+                            muted,
+                        );
                         let path = document.path().to_string();
                         // per-call copies: the Blame entry's listener moves them
                         // (the `oid` / `short` captures can only be shared, and
@@ -782,7 +805,10 @@ impl RepoView {
                                                 )
                                                 .child("Blame"),
                                         ),
-                                ),
+                                )
+                                .when_some(preview, |h, entry| {
+                                    h.child(div().text_color(muted).child("·")).child(entry)
+                                }),
                         )
                     }),
             )

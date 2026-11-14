@@ -5948,6 +5948,7 @@ version = "0.0.1"
 dependencies = [
  "glob",
  "gpui-kit",
+ "image",
  "notify",
  "smol",
  "spork-git",

@@ -1,6 +1,7 @@
 //! Spork desktop app. P1: repository sidebar (docs/specs/M03) and commit list with graph (M05).
 
 mod askpass;
+mod binary;
 mod blame;
 mod branches;
 mod changes;
@@ -153,6 +154,13 @@ struct RepoView {
     _lfs_status_task: Option<Task<()>>,
     /// The LFS status table (M14 §3); `None` outside the LFS view.
     lfs_status: Option<lfs::LfsStatus>,
+    // binary / image diff panels, one per diff view (M08 §3, binary.rs)
+    change_binary: Entity<binary::BinaryDiff>,
+    details_binary: Entity<binary::BinaryDiff>,
+    search_binary: Entity<binary::BinaryDiff>,
+    file_history_binary: Entity<binary::BinaryDiff>,
+    /// Re-renders when a panel's "Back to diff" closes it.
+    _binary_events: Vec<Subscription>,
 }
 
 struct Loaded {
@@ -241,6 +249,15 @@ impl RepoView {
                     cx.notify();
                 }
             });
+        // the commit-details and search panels open from a file header and close back to the diff
+        let change_binary = cx.new(|cx| binary::BinaryDiff::new(false, cx));
+        let details_binary = cx.new(|cx| binary::BinaryDiff::new(true, cx));
+        let search_binary = cx.new(|cx| binary::BinaryDiff::new(true, cx));
+        let file_history_binary = cx.new(|cx| binary::BinaryDiff::new(false, cx));
+        let _binary_events = [&details_binary, &search_binary]
+            .into_iter()
+            .map(|panel| cx.subscribe(panel, |_, _, _: &binary::BinaryDiffEvent, cx| cx.notify()))
+            .collect();
         let mut view = Self {
             requested,
             view: View::History,
@@ -331,6 +348,11 @@ impl RepoView {
             _lfs_task: None,
             _lfs_status_task: None,
             lfs_status: None,
+            change_binary,
+            details_binary,
+            search_binary,
+            file_history_binary,
+            _binary_events,
         };
         view.reload(cx);
         view
@@ -427,6 +449,7 @@ impl RepoView {
         self.details = None;
         let (root, id) = (repo.root.clone(), commit.id.clone());
         let parent = commit.parents.first().cloned();
+        self.show_binary(binary::BinaryPane::Details, None, cx);
         // replacing the task drops (cancels) a load for a previously clicked commit
         self._details_load = Some(cx.spawn(async move |this, cx| {
             let details = cx
@@ -442,6 +465,9 @@ impl RepoView {
                     }
                     _ => Vec::new(),
                 };
+                // a commit that only changes one binary file shows it right away (M08 §3)
+                let binary = this.binary_for_commit(&files);
+                this.show_binary(binary::BinaryPane::Details, binary, cx);
                 this.diff.update(cx, |state, cx| state.set_files(files, cx));
                 this.details = Some(details);
                 cx.notify();
@@ -903,6 +929,12 @@ impl RepoView {
             centered("This commit is too large to show inline.".into())
         } else if details.patch.is_empty() {
             centered("No file changes".into())
+        } else if self.binary_active(binary::BinaryPane::Details, cx) {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(self.details_binary.clone())
         } else {
             // per-file "File history" and "Blame" entries in the diff header (M08 §6, M08 §5)
             let view = cx.entity();
@@ -913,6 +945,7 @@ impl RepoView {
                 commit.id.chars().take(7).collect::<String>(),
             );
             let patterns = self.lfs_patterns().to_vec();
+            let preview_patterns = patterns.clone();
             v_flex().flex_1().min_h_0().w_full().child(
                 Diff::new(&self.diff)
                     .size_full()
@@ -925,6 +958,15 @@ impl RepoView {
                     })
                     .render_header_suffix(move |document, window, _| {
                         let view = view.clone();
+                        // binary / LFS files open in the binary panel (M08 §3)
+                        let preview = crate::binary::preview_entry(
+                            document,
+                            &preview_patterns,
+                            &view,
+                            crate::binary::BinaryPane::Details,
+                            window,
+                            muted,
+                        );
                         let path = document.path().to_string();
                         // per-call copies: the Blame entry's listener moves them
                         // (the `oid` / `short` captures can only be shared, and
@@ -987,7 +1029,10 @@ impl RepoView {
                                                 )
                                                 .child("Blame"),
                                         ),
-                                ),
+                                )
+                                .when_some(preview, |h, entry| {
+                                    h.child(div().text_color(muted).child("·")).child(entry)
+                                }),
                         )
                     }),
             )

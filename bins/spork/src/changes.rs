@@ -16,6 +16,7 @@ use spork_git::{GitError, PatchTarget, StatusEntry};
 use spork_patch::{FilePatch, Side};
 
 use crate::RepoView;
+use crate::binary::{BinaryPane, BinaryTarget};
 
 const ROW_HEIGHT: f32 = 26.;
 
@@ -268,13 +269,17 @@ impl RepoView {
             self.change_selected = None;
             self.change_diff
                 .update(cx, |s, cx| s.set_files(Vec::new(), cx));
+            self.show_binary(BinaryPane::Changes, None, cx);
             cx.notify();
             return;
         };
         let root = repo.root.clone();
+        // unstaged and untracked changes compare against the working-tree file itself
+        let worktree = !sel.staged;
         self._change_diff_load = Some(cx.spawn(async move |this, cx| {
             let conflicted = entry.conflicted;
             let path = entry.path.clone();
+            let binary_path = entry.path.clone();
             let text = cx
                 .background_spawn(async move {
                     if conflicted {
@@ -298,6 +303,12 @@ impl RepoView {
                     (Ok(p), false) => DiffFile::parse(p).unwrap_or_default(),
                     _ => Vec::new(),
                 };
+                // binary (or LFS pointer) changes show the binary / image panel (M08 §3)
+                let binary = match (&text, conflicted) {
+                    (Ok(p), false) => BinaryTarget::from_patch(p, &binary_path, worktree),
+                    _ => None,
+                };
+                this.show_binary(BinaryPane::Changes, binary, cx);
                 this.change_patch = if conflicted { None } else { text.ok() };
                 this.change_diff.update(cx, |s, cx| {
                     s.set_files(files, cx);
@@ -716,17 +727,23 @@ impl RepoView {
                     .size_full()
                     .children(self.conflict_bar(&sel.path, cx))
                     .children(self.selection_bar(sel.staged, cx))
-                    .child(
-                        Diff::new(&self.change_diff)
-                            .size_full()
-                            .render_header_title_suffix(move |document, _, app| {
-                                if crate::lfs::is_lfs_path(document.path().as_ref(), &patterns) {
-                                    crate::lfs::lfs_badge(app.theme())
-                                } else {
-                                    div()
-                                }
-                            }),
-                    )
+                    .map(|pane| {
+                        if self.binary_active(BinaryPane::Changes, cx) {
+                            return pane.child(self.change_binary.clone());
+                        }
+                        pane.child(
+                            Diff::new(&self.change_diff)
+                                .size_full()
+                                .render_header_title_suffix(move |document, _, app| {
+                                    if crate::lfs::is_lfs_path(document.path().as_ref(), &patterns)
+                                    {
+                                        crate::lfs::lfs_badge(app.theme())
+                                    } else {
+                                        div()
+                                    }
+                                }),
+                        )
+                    })
             }
             None => v_flex()
                 .size_full()

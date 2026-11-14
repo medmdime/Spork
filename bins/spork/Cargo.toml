@@ -12,5 +12,7 @@ spork-graph = { path = "../../crates/spork-graph" }
 spork-patch = { path = "../../crates/spork-patch" }
 gpui-kit = "0.9.1"
 glob = "0.3"
+# the image diff viewer builds gpui frames from decoded pixels (M08 §3); same version as gpui's
+image = { version = "0.25", default-features = false }
 notify = "8.2"
 smol = "2"

@@ -17,6 +17,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use spork_git::{FileCommit, GitError};
 
+use crate::binary::{BinaryPane, BinaryTarget};
 use crate::history::relative_age;
 use crate::{RepoView, View};
 
@@ -69,6 +70,7 @@ impl RepoView {
         });
         self.file_history_diff
             .update(cx, |state, cx| state.set_files(Vec::new(), cx));
+        self.show_binary(BinaryPane::FileHistory, None, cx);
         self.view = View::FileHistory;
         self._file_history_task = Some(cx.spawn(async move |this, cx| {
             let p = opened_path.clone();
@@ -134,6 +136,7 @@ impl RepoView {
             entry.path.clone(),
             entry.renamed_from.clone(),
         );
+        let shown_path = path.clone();
         // replacing the task cancels a load for a previously clicked row
         self._file_history_diff_load = Some(cx.spawn(async move |this, cx| {
             let patch = cx
@@ -154,9 +157,15 @@ impl RepoView {
                     }
                     _ => Vec::new(),
                 };
+                // binary (or LFS pointer) changes show the binary / image panel (M08 §3)
+                let binary = patch
+                    .as_ref()
+                    .ok()
+                    .and_then(|p| BinaryTarget::from_patch(p, &shown_path, false));
+                fh.diff = Some(patch);
                 this.file_history_diff
                     .update(cx, |state, cx| state.set_files(files, cx));
-                fh.diff = Some(patch);
+                this.show_binary(BinaryPane::FileHistory, binary, cx);
                 cx.notify();
             })
             .ok();
@@ -341,6 +350,7 @@ impl RepoView {
         self._file_history_diff_load = None;
         self._file_history_content_load = None;
         self.file_history = None;
+        self.show_binary(BinaryPane::FileHistory, None, cx);
         self.view = from;
         cx.notify();
     }
@@ -527,6 +537,11 @@ impl RepoView {
                 Some(Ok(patch)) if patch.len() > crate::MAX_PATCH_BYTES => {
                     centered("This file change is too large to show inline.".into())
                 }
+                Some(Ok(_)) if self.binary_active(BinaryPane::FileHistory, cx) => v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(self.file_history_binary.clone()),
                 Some(Ok(_)) => {
                     let patterns = self.lfs_patterns().to_vec();
                     v_flex().flex_1().min_h_0().w_full().child(
