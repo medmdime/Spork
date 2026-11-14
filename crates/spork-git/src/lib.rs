@@ -2,6 +2,7 @@
 
 pub mod gitflow;
 pub mod lean;
+pub mod lfs;
 
 use std::fmt;
 use std::io;
