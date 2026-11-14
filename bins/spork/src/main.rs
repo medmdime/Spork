@@ -179,7 +179,6 @@ struct Loaded {
     /// The `filter=lfs` patterns in the working-tree `.gitattributes` (M14
     /// follow-up badges); stored now so the follow-up does not touch this
     /// load path again.
-    #[allow(dead_code)]
     lfs_patterns: Vec<String>,
     /// The `git-lfs` extension is installed; a process-global check, cached once.
     lfs_installed: bool,
@@ -913,9 +912,18 @@ impl RepoView {
                 commit.id.clone(),
                 commit.id.chars().take(7).collect::<String>(),
             );
+            let patterns = self.lfs_patterns().to_vec();
             v_flex().flex_1().min_h_0().w_full().child(
-                Diff::new(&self.diff).size_full().render_header_suffix(
-                    move |document, window, _| {
+                Diff::new(&self.diff)
+                    .size_full()
+                    .render_header_title_suffix(move |document, _, app| {
+                        if lfs::is_lfs_path(document.path().as_ref(), &patterns) {
+                            lfs::lfs_badge(app.theme())
+                        } else {
+                            div()
+                        }
+                    })
+                    .render_header_suffix(move |document, window, _| {
                         let view = view.clone();
                         let path = document.path().to_string();
                         // per-call copies: the Blame entry's listener moves them
@@ -981,8 +989,7 @@ impl RepoView {
                                         ),
                                 ),
                         )
-                    },
-                ),
+                    }),
             )
         };
         pane.child(summary).child(body)

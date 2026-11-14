@@ -7,8 +7,10 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
+use glob::Pattern;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::IndexPath;
+use gpui_kit::component::Theme;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
@@ -69,6 +71,44 @@ pub fn lfs_remote_names(refs: &[Ref]) -> Vec<String> {
         .filter(|r| matches!(r.kind, RefKind::Remote))
         .map(|r| r.name.rsplit('/').next().unwrap_or(&r.name).to_owned())
         .collect()
+}
+
+/// Whether `path` matches one of the LFS `.gitattributes` patterns (M14 badges).
+/// A pattern without a slash matches the file name at any depth (`*.png` also
+/// matches `assets/a/b.png`); a pattern with a slash is matched against the
+/// full path (`images/**` matches `images/x.png`). A pattern that does not
+/// compile is skipped, so a broken `.gitattributes` never panics.
+pub fn is_lfs_path(path: &str, patterns: &[String]) -> bool {
+    for pattern in patterns {
+        let Some(glob) = Pattern::new(pattern).ok() else {
+            continue;
+        };
+        let matched = if pattern.contains('/') {
+            glob.matches(path)
+        } else {
+            path.rsplit('/')
+                .next()
+                .is_some_and(|name| glob.matches(name))
+        };
+        if matched {
+            return true;
+        }
+    }
+    false
+}
+
+/// The small "LFS" chip for the status list and the diff headers (M14 badges),
+/// styled after the history label badges.
+pub fn lfs_badge(theme: &Theme) -> Div {
+    let tint = theme.blue;
+    div()
+        .flex_none()
+        .px_1p5()
+        .rounded(px(4.))
+        .bg(tint.opacity(0.18))
+        .text_color(tint)
+        .text_xs()
+        .child("LFS")
 }
 
 /// One row of the LFS status table: a file joined with its lock, if any.
@@ -145,6 +185,19 @@ pub struct LfsMenuState {
 }
 
 impl crate::RepoView {
+    /// Whether the loaded repository tracks files with Git LFS (M14).
+    pub(crate) fn lfs_in_use(&self) -> bool {
+        matches!(&self.repo, Some(Ok(repo)) if repo.lfs_in_use)
+    }
+
+    /// The loaded repository's `filter=lfs` patterns, for the status and diff badges (M14).
+    pub(crate) fn lfs_patterns(&self) -> &[String] {
+        match &self.repo {
+            Some(Ok(repo)) => &repo.lfs_patterns,
+            _ => &[],
+        }
+    }
+
     /// Snapshot of the LFS facts for the "Git LFS" submenu (M14 §1–§2).
     pub fn lfs_menu_state(&self) -> LfsMenuState {
         let Some(Ok(repo)) = self.repo.as_ref() else {
@@ -971,9 +1024,9 @@ pub fn lfs_submenu(
 #[cfg(test)]
 mod tests {
     use super::{
-        LfsFile, LfsLock, Ref, RefKind, lfs_format_size, lfs_install_hooks_enabled, lfs_join_rows,
-        lfs_pattern_from_path, lfs_remote_names, lfs_remote_op_enabled, lfs_row_actions,
-        lfs_track_op_enabled,
+        LfsFile, LfsLock, Ref, RefKind, is_lfs_path, lfs_format_size, lfs_install_hooks_enabled,
+        lfs_join_rows, lfs_pattern_from_path, lfs_remote_names, lfs_remote_op_enabled,
+        lfs_row_actions, lfs_track_op_enabled,
     };
 
     fn file(path: &str, oid: &str, size: u64, downloaded: bool) -> LfsFile {
@@ -1030,6 +1083,21 @@ mod tests {
             upstream_gone: false,
             is_head: false,
         }
+    }
+
+    #[test]
+    fn lfs_path_matches_basename_and_slash_patterns() {
+        // a pattern without a slash matches the file name at any depth
+        assert!(is_lfs_path("b.png", &["*.png".to_owned()]));
+        assert!(is_lfs_path("assets/a/b.png", &["*.png".to_owned()]));
+        // a pattern with a slash matches the full path
+        assert!(is_lfs_path("images/x.png", &["images/**".to_owned()]));
+        assert!(is_lfs_path("images/sub/y.png", &["images/**".to_owned()]));
+        // no match, empty patterns, and a broken pattern never match or panic
+        assert!(!is_lfs_path("a.txt", &["*.png".to_owned()]));
+        assert!(!is_lfs_path("other/x.png", &["images/**".to_owned()]));
+        assert!(!is_lfs_path("a.png", &[]));
+        assert!(!is_lfs_path("a.png", &["[".to_owned()]));
     }
 
     #[test]

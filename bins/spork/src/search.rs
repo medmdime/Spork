@@ -707,9 +707,17 @@ impl RepoView {
                 commit.id.clone(),
                 commit.id.chars().take(7).collect::<String>(),
             );
+            let patterns = self.lfs_patterns().to_vec();
             v_flex().flex_1().min_h_0().w_full().child(
                 Diff::new(&self.search_diff)
                     .size_full()
+                    .render_header_title_suffix(move |document, _, app| {
+                        if crate::lfs::is_lfs_path(document.path().as_ref(), &patterns) {
+                            crate::lfs::lfs_badge(app.theme())
+                        } else {
+                            div()
+                        }
+                    })
                     .render_header_suffix(move |document, window, _| {
                         let view = view.clone();
                         let path = document.path().to_string();

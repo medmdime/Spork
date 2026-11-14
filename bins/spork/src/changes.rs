@@ -153,6 +153,8 @@ impl RepoView {
         });
     }
 
+    /// Commit; with LFS in use, `git lfs locks --verify` runs first and a
+    /// violation asks for confirmation before the commit (M14 edge cases).
     fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let subject = self.subject.read(cx).value().trim().to_owned();
         let body = self.description.read(cx).value().trim().to_owned();
@@ -166,17 +168,73 @@ impl RepoView {
             format!("{subject}\n\n{body}")
         };
         let amend = self.amend;
+        let verify = self.lfs_in_use();
+        let (lfs_message, lfs_amend) = (message.clone(), amend);
         self.run_op(
             window,
             cx,
-            move |root| spork_git::commit(root, &message, amend),
-            |this, _, window, cx| {
-                this.subject.update(cx, |s, cx| s.set_value("", window, cx));
-                this.description
-                    .update(cx, |s, cx| s.set_value("", window, cx));
-                this.amend = false;
+            move |root| {
+                // one background task: verify the locks, then commit unless the user is asked
+                if verify {
+                    let warnings = spork_git::lfs::lfs_locks_verify(root);
+                    if !warnings.is_empty() {
+                        return Ok(Some(warnings));
+                    }
+                }
+                spork_git::commit(root, &message, amend)?;
+                Ok(None)
+            },
+            move |this, warnings, window, cx| match warnings {
+                Some(warnings) => {
+                    this.confirm_lfs_lock_commit(lfs_message, lfs_amend, warnings, window, cx)
+                }
+                None => this.clear_commit_box(window, cx),
             },
         );
+    }
+
+    /// Confirms a commit whose `git lfs locks --verify` found violations (M14
+    /// edge cases): the commit only runs on "Proceed".
+    fn confirm_lfs_lock_commit(
+        &mut self,
+        message: String,
+        amend: bool,
+        warnings: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (view, value) = (view.clone(), message.clone());
+            dialog
+                .title("Locked files changed elsewhere")
+                .description(warnings.join("\n"))
+                .confirm()
+                .show_cancel(true)
+                .ok_text("Proceed")
+                .cancel_text("Cancel")
+                .on_ok(move |_, window, cx| {
+                    // the dialog callback is `Fn` (one per open), so clone the message
+                    let value = value.clone();
+                    view.update(cx, |this, cx| {
+                        this.run_op(
+                            window,
+                            cx,
+                            move |root| spork_git::commit(root, &value, amend),
+                            |this, _, window, cx| this.clear_commit_box(window, cx),
+                        )
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Clears the commit box after a successful commit.
+    fn clear_commit_box(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.subject.update(cx, |s, cx| s.set_value("", window, cx));
+        self.description
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.amend = false;
     }
 
     fn set_amend(&mut self, amend: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -260,11 +318,13 @@ impl RepoView {
     ) -> Vec<Stateful<Div>> {
         let entries: Vec<StatusEntry> = self.status_entries(staged).into_iter().cloned().collect();
         let theme = cx.theme();
+        let patterns = self.lfs_patterns();
         let (muted, active, hover) = (theme.muted_foreground, theme.list_active, theme.list_hover);
         range
             .filter_map(|ix| entries.get(ix).cloned().map(|e| (ix, e)))
             .map(|(ix, entry)| {
                 let (letter, color) = status_letter(&entry, staged, cx);
+                let is_lfs = crate::lfs::is_lfs_path(&entry.path, patterns);
                 let (dir, name) = match entry.path.rsplit_once('/') {
                     Some((dir, name)) => (format!("{dir}/"), name.to_owned()),
                     None => (String::new(), entry.path.clone()),
@@ -313,6 +373,7 @@ impl RepoView {
                                     .child(dir),
                             ),
                     )
+                    .when(is_lfs, |row| row.child(crate::lfs::lfs_badge(cx.theme())))
                     .when(entry.conflicted, |row| {
                         let (mine, theirs) = (entry.path.clone(), entry.path.clone());
                         row.child(
@@ -649,11 +710,24 @@ impl RepoView {
             .child(self.file_section(true, cx))
             .child(self.commit_box(cx));
         let right = match &self.change_selected {
-            Some(sel) => v_flex()
-                .size_full()
-                .children(self.conflict_bar(&sel.path, cx))
-                .children(self.selection_bar(sel.staged, cx))
-                .child(Diff::new(&self.change_diff).size_full()),
+            Some(sel) => {
+                let patterns = self.lfs_patterns().to_vec();
+                v_flex()
+                    .size_full()
+                    .children(self.conflict_bar(&sel.path, cx))
+                    .children(self.selection_bar(sel.staged, cx))
+                    .child(
+                        Diff::new(&self.change_diff)
+                            .size_full()
+                            .render_header_title_suffix(move |document, _, app| {
+                                if crate::lfs::is_lfs_path(document.path().as_ref(), &patterns) {
+                                    crate::lfs::lfs_badge(app.theme())
+                                } else {
+                                    div()
+                                }
+                            }),
+                    )
+            }
             None => v_flex()
                 .size_full()
                 .items_center()

@@ -5946,6 +5946,7 @@ dependencies = [
 name = "spork"
 version = "0.0.1"
 dependencies = [
+ "glob",
  "gpui-kit",
  "notify",
  "smol",

@@ -527,11 +527,22 @@ impl RepoView {
                 Some(Ok(patch)) if patch.len() > crate::MAX_PATCH_BYTES => {
                     centered("This file change is too large to show inline.".into())
                 }
-                Some(Ok(_)) => v_flex().flex_1().min_h_0().w_full().child(
-                    Diff::new(&self.file_history_diff)
-                        .size_full()
-                        .render_header_title_suffix(move |document, _, _| document.path().clone()),
-                ),
+                Some(Ok(_)) => {
+                    let patterns = self.lfs_patterns().to_vec();
+                    v_flex().flex_1().min_h_0().w_full().child(
+                        Diff::new(&self.file_history_diff)
+                            .size_full()
+                            .render_header_title_suffix(move |document, _, app| {
+                                let is_lfs =
+                                    crate::lfs::is_lfs_path(document.path().as_ref(), &patterns);
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(document.path().clone())
+                                    .when(is_lfs, |d| d.child(crate::lfs::lfs_badge(app.theme())))
+                            }),
+                    )
+                }
             }
         };
         pane.child(body)
