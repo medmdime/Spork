@@ -7,6 +7,7 @@ mod history;
 mod operations;
 mod rebase;
 mod repos;
+mod search;
 mod worktrees;
 
 use std::collections::BTreeMap;
@@ -17,7 +18,7 @@ use changes::ChangeSelection;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffState};
-use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
@@ -28,7 +29,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use history::{History, ROW_HEIGHT};
 use spork_git::{
-    CommitDetails, GitError, OpState, Ref, RefKind, Stash, StatusEntry, Submodule, Worktree,
+    Commit, CommitDetails, GitError, OpState, Ref, RefKind, SearchQuery, Stash, StatusEntry,
+    Submodule, Worktree,
 };
 
 // shortcut: fixed cap until the history loads incrementally (M05 §1 batches), then it becomes a setting.
@@ -38,6 +40,8 @@ const MAX_COMMITS: usize = 50_000;
 enum View {
     Changes,
     History,
+    /// Deep commit search: form + results (docs/specs/M05 §5).
+    Search,
     /// Interactive rebase plan editor (rebase.rs).
     Rebase,
 }
@@ -83,6 +87,24 @@ struct RepoView {
     busy: bool,
     _op: Option<Task<()>>,
     _appearance: Subscription,
+    // quick filter over the loaded history (M05 §5)
+    filter: Option<search::QuickFilter>,
+    filter_input: Entity<InputState>,
+    _filter_events: Subscription,
+    // deep search (M05 §5)
+    search: Option<SearchState>,
+    search_diff: Entity<DiffState>,
+    _search_task: Option<Task<()>>,
+    _search_details_load: Option<Task<()>>,
+    search_cancel: spork_git::Cancellable,
+    search_message: Entity<InputState>,
+    search_author: Entity<InputState>,
+    search_committer: Entity<InputState>,
+    search_content: Entity<InputState>,
+    search_path: Entity<InputState>,
+    search_since: Entity<InputState>,
+    search_until: Entity<InputState>,
+    recent_searches: Vec<SearchQuery>,
 }
 
 struct Loaded {
@@ -95,6 +117,18 @@ struct Loaded {
     worktrees: Vec<Worktree>,
     submodules: Vec<Submodule>,
     history: History,
+}
+
+/// Deep-search state (M05 §5): results replace the history list while the Search view is active.
+struct SearchState {
+    commits: Vec<Commit>,
+    selected: Option<usize>,
+    /// Details of the selected result; `None` while loading.
+    details: Option<Result<CommitDetails, GitError>>,
+    running: bool,
+    /// The run was cancelled by the user (rather than failing).
+    cancelled: bool,
+    error: Option<String>,
 }
 
 impl RepoView {
@@ -120,6 +154,19 @@ impl RepoView {
                 cx.notify();
             }
         });
+        let filter_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Filter by SHA, author, or subject…")
+        });
+        // quick filter: typing re-filters the loaded rows, Enter / Shift-Enter walk the matches (M05 §5)
+        let _filter_events =
+            cx.subscribe(
+                &filter_input,
+                |this, _, event: &InputEvent, cx| match event {
+                    InputEvent::Change => this.refilter(cx),
+                    InputEvent::PressEnter { shift, .. } => this.step_filter(*shift, cx),
+                    InputEvent::Focus | InputEvent::Blur => {}
+                },
+            );
         let mut view = Self {
             requested,
             view: View::History,
@@ -162,6 +209,26 @@ impl RepoView {
             busy: false,
             _op: None,
             _appearance,
+            filter: None,
+            filter_input,
+            _filter_events,
+            search: None,
+            search_diff: cx.new(|cx| DiffState::new([], cx)),
+            _search_task: None,
+            _search_details_load: None,
+            search_cancel: spork_git::Cancellable::default(),
+            search_message: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Text in the commit message")),
+            search_author: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Name or email (regex)")),
+            search_committer: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Name or email (regex)")),
+            search_content: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Pickaxe regex over the diff")),
+            search_path: cx.new(|cx| InputState::new(window, cx).placeholder("e.g. src/main.rs")),
+            search_since: cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 2024-01-01")),
+            search_until: cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 2024-06-30")),
+            recent_searches: search::recent_searches(),
         };
         view.reload(cx);
         view
@@ -191,6 +258,10 @@ impl RepoView {
                     this.selected = ix;
                     if this._watcher.is_none() {
                         this.watch(root, cx);
+                    }
+                    // a quick filter stays open across reloads: re-map it onto the new rows
+                    if this.filter.is_some() {
+                        this.refilter(cx);
                     }
                 }
                 // refresh the open file diff (or clear it if the file is no longer changed)
@@ -245,7 +316,7 @@ impl RepoView {
 
 impl RepoView {
     /// Selects a commit and loads its details + patch in the background (M06).
-    fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(crate) fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(Ok(repo)) = &self.repo else { return };
         let Some(commit) = repo.history.commits.get(ix) else {
             return;
@@ -318,7 +389,7 @@ impl RepoView {
     }
 }
 
-const MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
 
 fn load(path: &Path) -> Result<Loaded, GitError> {
     let root = spork_git::toplevel(path)?;
@@ -404,6 +475,69 @@ fn section(
         .children(children)
 }
 
+/// The commit summary block shared by the history details pane and the search results pane.
+pub(crate) fn commit_summary(
+    commit: &Commit,
+    details: &CommitDetails,
+    cx: &mut Context<RepoView>,
+) -> Div {
+    let muted = cx.theme().muted_foreground;
+    let mono = cx.theme().mono_font_family.clone();
+    let (_, body) = details
+        .message
+        .split_once("\n\n")
+        .unwrap_or((&details.message, ""));
+    let mut who = format!(
+        "{} <{}> · {}",
+        commit.author, details.author_email, details.author_date
+    );
+    if details.committer != commit.author {
+        who.push_str(&format!(
+            "   committed by {} · {}",
+            details.committer, details.committer_date
+        ));
+    }
+    let short = |id: &String| id.chars().take(7).collect::<String>();
+    let parents = commit
+        .parents
+        .iter()
+        .map(short)
+        .collect::<Vec<_>>()
+        .join(", ");
+    v_flex()
+        .flex_none()
+        .max_h(px(160.))
+        .overflow_hidden()
+        .px_4()
+        .py_3()
+        .gap_1()
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(commit.subject.clone()),
+        )
+        .when(!body.trim().is_empty(), |d| {
+            d.child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(body.trim().to_owned()),
+            )
+        })
+        .child(div().text_xs().text_color(muted).child(who))
+        .child(
+            h_flex()
+                .gap_3()
+                .text_xs()
+                .text_color(muted)
+                .font_family(mono)
+                .child(commit.id.clone())
+                .when(!parents.is_empty(), |d| {
+                    d.child(format!("parents {parents}"))
+                }),
+        )
+}
+
 impl Render for RepoView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -414,6 +548,13 @@ impl Render for RepoView {
             .text_color(theme.foreground)
             .child(TitleBar::new().child(div().text_sm().child("Spork")))
             .child(self.body(cx).flex_1().min_h_0())
+            // Cmd-F opens the quick filter bar in the history view (M05 §5)
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                let m = &e.keystroke.modifiers;
+                if m.platform && !m.shift && !m.control && !m.alt && e.keystroke.key == "f" {
+                    this.open_filter(window, cx);
+                }
+            }))
     }
 }
 
@@ -505,6 +646,13 @@ impl RepoView {
                             this.view = View::History;
                             cx.notify();
                         })),
+                    SidebarMenuItem::new("Search")
+                        .icon(IconName::Search)
+                        .active(self.view == View::Search)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.view = View::Search;
+                            cx.notify();
+                        })),
                     section(
                         "Branches",
                         locals.len(),
@@ -556,6 +704,10 @@ impl RepoView {
             let changes = self.changes_view(cx);
             return base.child(sidebar).child(panel.child(changes));
         }
+        if self.view == View::Search {
+            let search = self.search_view(cx);
+            return base.child(sidebar).child(panel.child(search));
+        }
         if count == 0 {
             return base
                 .child(sidebar)
@@ -564,6 +716,10 @@ impl RepoView {
         let list = v_flex()
             .size_full()
             .child(history::header(lanes, cx))
+            // the quick filter bar sits above the list (M05 §5)
+            .when(self.filter.is_some(), |list| {
+                list.child(self.filter_bar(cx))
+            })
             .child(
                 uniform_list(
                     "history",
@@ -592,7 +748,6 @@ impl RepoView {
     fn details_view(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
-        let mono = theme.mono_font_family.clone();
         let pane = v_flex().size_full().border_t_1().border_color(border);
         let centered = |msg: String| {
             v_flex()
@@ -613,60 +768,7 @@ impl RepoView {
             Some(Ok(d)) => d,
         };
 
-        let (_, body) = details
-            .message
-            .split_once("\n\n")
-            .unwrap_or((&details.message, ""));
-        let mut who = format!(
-            "{} <{}> · {}",
-            commit.author, details.author_email, details.author_date
-        );
-        if details.committer != commit.author {
-            who.push_str(&format!(
-                "   committed by {} · {}",
-                details.committer, details.committer_date
-            ));
-        }
-        let short = |id: &String| id.chars().take(7).collect::<String>();
-        let parents = commit
-            .parents
-            .iter()
-            .map(short)
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let summary = v_flex()
-            .flex_none()
-            .max_h(px(160.))
-            .overflow_hidden()
-            .px_4()
-            .py_3()
-            .gap_1()
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(commit.subject.clone()),
-            )
-            .when(!body.trim().is_empty(), |d| {
-                d.child(
-                    div()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(body.trim().to_owned()),
-                )
-            })
-            .child(div().text_xs().text_color(muted).child(who))
-            .child(
-                h_flex()
-                    .gap_3()
-                    .text_xs()
-                    .text_color(muted)
-                    .font_family(mono)
-                    .child(commit.id.clone())
-                    .when(!parents.is_empty(), |d| {
-                        d.child(format!("parents {parents}"))
-                    }),
-            );
+        let summary = commit_summary(commit, details, cx);
 
         let body = if details.patch.len() > MAX_PATCH_BYTES {
             centered("This commit is too large to show inline.".into())
@@ -698,12 +800,15 @@ impl RepoView {
         let theme = cx.theme();
         let (muted, hover, active) = (theme.muted_foreground, theme.list_hover, theme.list_active);
         let mono = theme.mono_font_family.clone();
+        let filter = self.filter.as_ref().filter(|f| !f.query.trim().is_empty());
 
         range
             .map(|ix| {
                 let commit = &h.commits[ix];
                 let labels = h.labels.get(&commit.id).into_iter().flatten();
                 let menu = RepoView::commit_menu(view.clone(), commit.id.clone());
+                // a filtered-out row is dimmed; the current match takes the active color (M05 §5)
+                let highlight = filter.and_then(|f| f.highlight(ix));
                 h_flex()
                     .id(ix)
                     .w_full()
@@ -712,6 +817,13 @@ impl RepoView {
                     .gap_3()
                     .text_sm()
                     .when(self.selected == Some(ix), |row| row.bg(active))
+                    .when(highlight == Some(false), |row| row.bg(hover))
+                    .when(highlight == Some(true), |row| row.bg(active))
+                    .opacity(if filter.is_some() && highlight.is_none() {
+                        0.35
+                    } else {
+                        1.0
+                    })
                     .hover(move |row| row.bg(hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.select(ix, cx)))
                     .child(history::graph_cell(

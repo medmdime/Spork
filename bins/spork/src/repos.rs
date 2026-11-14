@@ -93,6 +93,11 @@ impl RepoView {
         self.details = None;
         self.change_selected = None;
         self.rebase_plan = None;
+        // a repo switch invalidates the search UI too (M05 §5)
+        self.filter = None;
+        self.search = None;
+        self._search_task = None;
+        self.search_cancel.kill();
         self.view = View::History;
         self._watcher = None;
         self.reload(cx);

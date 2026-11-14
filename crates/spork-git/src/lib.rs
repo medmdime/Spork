@@ -1,8 +1,11 @@
 //! The one place Spork runs git (docs/00-overview.md §3.4) plus the ref reader behind the sidebar (docs/specs/M03).
 
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
@@ -78,15 +81,45 @@ pub fn run_with_input(
     args: &[&str],
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>, GitError> {
-    run_with_env(repo, args, input, &[])
+    run_with_env(repo, args, input, &[], None)
+}
+
+/// A handle that can kill the git child of a [`run_cancellable`] call. Cloning is cheap;
+/// `kill` is safe from the UI thread and a no-op when nothing is running. Dropping the
+/// task that started the run is not enough on its own — the git process keeps running
+/// until it is killed or it exits on its own (M05 §5). One handle covers one run; make
+/// a fresh one for each run.
+#[derive(Clone, Default)]
+pub struct Cancellable {
+    kill: Arc<AtomicBool>,
+}
+
+impl Cancellable {
+    /// Requests that the running child be killed. The blocking run returns an error
+    /// within milliseconds.
+    pub fn kill(&self) {
+        self.kill.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Like [`run`], but the spawned child can be killed through `cancel`. Blocks until the
+/// child exits — on its own, or shortly after `cancel.kill()`.
+pub fn run_cancellable(
+    repo: &Path,
+    args: &[&str],
+    cancel: &Cancellable,
+) -> Result<Vec<u8>, GitError> {
+    run_with_env(repo, args, None, &[], Some(cancel))
 }
 
 /// Like [`run_with_input`], with extra environment variables for this one command.
+/// When `cancel` is given, the child can be killed through the handle (M05 §5).
 fn run_with_env(
     repo: &Path,
     args: &[&str],
     input: Option<&[u8]>,
     env: &[(&str, &str)],
+    cancel: Option<&Cancellable>,
 ) -> Result<Vec<u8>, GitError> {
     let mut cmd = Command::new(git_binary());
     cmd.args(["-c", "core.quotepath=false", "-c", "color.ui=false"])
@@ -121,9 +154,39 @@ fn run_with_env(
         let input = input.to_vec();
         std::thread::spawn(move || std::io::Write::write_all(&mut stdin, &input));
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| GitError::GitMissing(e.to_string()))?;
+    let out = if let Some(cancel) = cancel {
+        // the child stays owned by the reaper thread; only it may call `kill` on it,
+        // so cancellation is a flag, never a handover of the handle
+        let kill = cancel.kill.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break collect_output(child, status),
+                    Ok(None) => {
+                        if kill.load(Ordering::SeqCst) {
+                            child.kill().ok();
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => break Err(e),
+                }
+            };
+            let _ = tx.send(result);
+        });
+        rx.recv()
+            .map_err(|e| GitError::Other {
+                code: None,
+                stderr: e.to_string(),
+            })?
+            .map_err(|e| GitError::GitMissing(e.to_string()))?
+    } else {
+        child
+            .wait_with_output()
+            .map_err(|e| GitError::GitMissing(e.to_string()))?
+    };
     if out.status.success() {
         Ok(out.stdout)
     } else {
@@ -132,6 +195,23 @@ fn run_with_env(
             &String::from_utf8_lossy(&out.stderr),
         ))
     }
+}
+
+/// Collects the output an already-reaped child left in its pipes.
+fn collect_output(mut child: Child, status: ExitStatus) -> io::Result<Output> {
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        std::io::Read::read_to_end(&mut pipe, &mut stdout)?;
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        std::io::Read::read_to_end(&mut pipe, &mut stderr)?;
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Top-level directory of the repository containing `path`.
@@ -297,6 +377,71 @@ pub fn parse_log(out: &str) -> Vec<Commit> {
             })
         })
         .collect()
+}
+
+/// Fields of a deep commit search (M05 §5); a field only takes effect when it is not blank.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchQuery {
+    /// `--grep` (case-insensitive) on the subject.
+    pub message: String,
+    /// `--author` regex.
+    pub author: String,
+    /// `--committer` regex.
+    pub committer: String,
+    /// Pickaxe regex over each commit's diff (`-G`).
+    pub content: String,
+    /// Pathspec: only commits touching this path.
+    pub path: String,
+    /// `--since` date.
+    pub since: String,
+    /// `--until` date.
+    pub until: String,
+}
+
+/// The `git log` arguments for a deep search (M05 §5). Pure, so it is testable without a repo.
+pub fn build_search_args(q: &SearchQuery) -> Vec<String> {
+    let has = |s: &str| !s.trim().is_empty();
+    let mut args = vec![
+        "log".to_string(),
+        "-z".to_string(),
+        "--all".to_string(),
+        LOG_FORMAT.to_string(),
+    ];
+    if has(&q.message) {
+        args.extend([
+            "--grep".to_string(),
+            q.message.trim().to_string(),
+            "-i".to_string(),
+        ]);
+    }
+    if has(&q.author) {
+        args.extend(["--author".to_string(), q.author.trim().to_string()]);
+    }
+    if has(&q.committer) {
+        args.extend(["--committer".to_string(), q.committer.trim().to_string()]);
+    }
+    if has(&q.content) {
+        args.extend(["-G".to_string(), q.content.trim().to_string()]);
+    }
+    if has(&q.since) {
+        args.extend(["--since".to_string(), q.since.trim().to_string()]);
+    }
+    if has(&q.until) {
+        args.extend(["--until".to_string(), q.until.trim().to_string()]);
+    }
+    if has(&q.path) {
+        args.extend(["--".to_string(), q.path.trim().to_string()]);
+    }
+    args
+}
+
+/// Deep commit search (M05 §5): `git log --all` with the query's filters, in commit-row shape.
+/// The git child is registered in `cancel` so the caller can kill it (see [`run_cancellable`]).
+pub fn search(repo: &Path, q: &SearchQuery, cancel: &Cancellable) -> Result<Vec<Commit>, GitError> {
+    let args = build_search_args(q);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_cancellable(repo, &args, cancel)?;
+    Ok(parse_log(&String::from_utf8_lossy(&out)))
 }
 
 /// Git's well-known empty tree: the "parent" of a root commit.
@@ -827,6 +972,7 @@ pub fn interactive_rebase(
         &["rebase", "--interactive", "--autostash", base],
         None,
         &[("GIT_SEQUENCE_EDITOR", &editor)],
+        None,
     );
     std::fs::remove_file(&file).ok();
     allow_conflicts(repo, result)
@@ -2168,5 +2314,227 @@ mod tests {
             classify(err.status.code(), &String::from_utf8_lossy(&err.stderr)),
             GitError::NotARepo
         );
+    }
+
+    #[test]
+    fn search_args_for_an_empty_query() {
+        assert_eq!(
+            build_search_args(&SearchQuery::default()),
+            vec!["log", "-z", "--all", LOG_FORMAT]
+        );
+    }
+
+    #[test]
+    fn search_args_skip_blank_fields_and_trim_the_rest() {
+        let q = SearchQuery {
+            message: "  fix login  ".into(),
+            author: "Jane".into(),
+            committer: "   ".into(),
+            content: "fn main".into(),
+            path: "src/lib.rs".into(),
+            since: "2024-01-01".into(),
+            until: String::new(),
+        };
+        assert_eq!(
+            build_search_args(&q),
+            vec![
+                "log",
+                "-z",
+                "--all",
+                LOG_FORMAT,
+                "--grep",
+                "fix login",
+                "-i",
+                "--author",
+                "Jane",
+                "-G",
+                "fn main",
+                "--since",
+                "2024-01-01",
+                "--",
+                "src/lib.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn deep_search_filters_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        // dated commit: sets author/committer identity and both dates; increasing dates
+        // along the chain keep the date-limited history walk well behaved
+        let dated = |msg: &str, user: &str, email: &str, date: &str, extra: &[&str]| {
+            let name = format!("user.name={user}");
+            let mail = format!("user.email={email}");
+            let mut args = vec![
+                "-c",
+                name.as_str(),
+                "-c",
+                mail.as_str(),
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ];
+            args.extend_from_slice(extra);
+            let ok = Command::new("git")
+                .args(&args)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .current_dir(d)
+                .status()
+                .unwrap();
+            assert!(ok.success());
+        };
+        dated(
+            "add parser",
+            "Spork Test",
+            "test@spork.invalid",
+            "2019-05-01T12:00:00",
+            &["--allow-empty"],
+        );
+        std::fs::write(d.join("hello.txt"), "first line\n").unwrap();
+        git(d, &["add", "hello.txt"]);
+        dated(
+            "fix parser bug",
+            "Spork Test",
+            "test@spork.invalid",
+            "2022-05-01T12:00:00",
+            &[],
+        );
+        std::fs::write(d.join("hello.txt"), "second line\n").unwrap();
+        git(d, &["add", "hello.txt"]);
+        // third commit: different author and committer, newest in the chain
+        dated(
+            "update docs",
+            "CI Bot",
+            "ci@spork.invalid",
+            "2024-05-01T12:00:00",
+            &["--author", "Other Dev <other@spork.invalid>"],
+        );
+        // an older branch: its tip is the 2019 commit, so the --all walk reaches it
+        git(d, &["branch", "old", "HEAD~2"]);
+        // unreachable commit (not on any ref): --all must not find it
+        git(d, &["commit", "-q", "--allow-empty", "-m", "lost commit"]);
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+
+        let all = search(d, &SearchQuery::default(), &Cancellable::default()).unwrap();
+        assert_eq!(all.len(), 3);
+
+        let by_message = search(
+            d,
+            &SearchQuery {
+                message: "PARSER".into(),
+                ..Default::default()
+            },
+            &Cancellable::default(),
+        )
+        .unwrap();
+        assert_eq!(by_message.len(), 2); // case-insensitive: "add parser" and "fix parser bug"
+
+        let by_author = search(
+            d,
+            &SearchQuery {
+                author: "Other Dev".into(),
+                ..Default::default()
+            },
+            &Cancellable::default(),
+        )
+        .unwrap();
+        assert_eq!(by_author.len(), 1);
+        assert_eq!(by_author[0].author, "Other Dev");
+
+        let by_committer = search(
+            d,
+            &SearchQuery {
+                committer: "Spork Test".into(),
+                ..Default::default()
+            },
+            &Cancellable::default(),
+        )
+        .unwrap();
+        assert_eq!(by_committer.len(), 2);
+
+        let by_content = search(
+            d,
+            &SearchQuery {
+                content: "second line".into(),
+                ..Default::default()
+            },
+            &Cancellable::default(),
+        )
+        .unwrap();
+        assert_eq!(by_content.len(), 1);
+        assert_eq!(by_content[0].subject, "update docs");
+
+        let by_path = search(
+            d,
+            &SearchQuery {
+                path: "hello.txt".into(),
+                ..Default::default()
+            },
+            &Cancellable::default(),
+        )
+        .unwrap();
+        assert_eq!(by_path.len(), 2);
+
+        // date limits prune the history walk: --until reaches the 2019 commit only via
+        // the old branch tip, --since walks the main chain and stops at it
+        let old = search(
+            d,
+            &SearchQuery {
+                until: "2021-01-01".into(),
+                ..Default::default()
+            },
+            &Cancellable::default(),
+        )
+        .unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].subject, "add parser");
+        let recent = search(
+            d,
+            &SearchQuery {
+                since: "2021-01-01".into(),
+                ..Default::default()
+            },
+            &Cancellable::default(),
+        )
+        .unwrap();
+        assert_eq!(recent.len(), 2);
+
+        let lost = search(
+            d,
+            &SearchQuery {
+                message: "lost".into(),
+                ..Default::default()
+            },
+            &Cancellable::default(),
+        )
+        .unwrap();
+        assert!(lost.is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_run_kills_the_git_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().to_path_buf();
+        git(&d, &["init", "-q", "-b", "main"]);
+        let cancel = Cancellable::default();
+        // `git daemon` never exits on its own: the run ends only when the process is killed
+        let inner = cancel.clone();
+        let run = std::thread::spawn(move || {
+            // port 0: an ephemeral port, so no bind conflicts with other daemons
+            run_cancellable(
+                &d,
+                &["daemon", "--reuseaddr", "--listen=127.0.0.1", "--port=0"],
+                &inner,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500)); // let it spawn
+        cancel.kill();
+        assert!(run.join().unwrap().is_err());
     }
 }
