@@ -63,7 +63,7 @@ behaviour predictable and testable without a window. Details: [docs/00-overview.
 | Phase | Scope | State |
 |---|---|---|
 | P0 Foundations | git runner, error handling, repo view with branches/remotes/tags, themes, auto-refresh, CI on 3 OSes | ✓ done |
-| **P1 Read-only client** | commit graph ✓, commit details ✓, diffs ✓, blame, file history, search | **in progress** |
+| P1 Read-only client | commit graph ✓, commit details ✓, diffs ✓, blame ✓, file history ✓, search ✓ | ✓ done |
 | P2 Daily driver | staging incl. single lines ✓, discard ✓, commit ✓, amend ✓, fetch/pull/push ✓, branches ✓, password prompts ✓ | ✓ done |
 | P3 History editing | merge ✓, rebase ✓, interactive rebase ✓, 3-way conflict resolver ✓, cherry-pick ✓, revert ✓, stashes ✓, tags ✓ | ✓ done |
 | **P4 Breadth** | open / clone / new ✓, recent repos ✓, submodules ✓, worktrees ✓, git-flow, LFS, image diffs | **in progress** |
