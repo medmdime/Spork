@@ -509,6 +509,183 @@ pub fn commit_details(
     })
 }
 
+// ---------------------------------------------------------------------------
+// File history (docs/specs/M08 §6)
+// ---------------------------------------------------------------------------
+
+/// One commit in a file's history (docs/specs/M08 §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCommit {
+    pub oid: String,
+    pub author: String,
+    /// Author time, Unix seconds.
+    pub date: i64,
+    pub subject: String,
+    /// The path the file has in this commit's tree; an older name when the file
+    /// was renamed later on.
+    pub path: String,
+    /// Set when this commit itself renamed the file: the previous path.
+    pub renamed_from: Option<String>,
+}
+
+/// The commits that touched one path, following renames, newest first
+/// (docs/specs/M08 §6): `git log --follow -z --name-status` in commit-row shape.
+/// The git child is registered in `cancel` so the caller can kill it
+/// (see [`run_cancellable`]).
+pub fn file_history(
+    repo: &Path,
+    path: &str,
+    cancel: &Cancellable,
+) -> Result<Vec<FileCommit>, GitError> {
+    let out = run_cancellable(
+        repo,
+        &[
+            "log",
+            "--follow",
+            "-z",
+            "--name-status",
+            LOG_FORMAT,
+            "--",
+            path,
+        ],
+        cancel,
+    )?;
+    parse_file_history(&String::from_utf8_lossy(&out))
+}
+
+/// Parses [`file_history`] output. Records are NUL-separated: a commit row
+/// (`LOG_FORMAT` fields) followed by that commit's one name-status entry — a
+/// status letter (`M`, `A`, `D`, `T`, or `R`/`C` with an optional similarity
+/// score) and the touched path(s). Malformed output is an error, not a skip.
+pub fn parse_file_history(out: &str) -> Result<Vec<FileCommit>, GitError> {
+    fn malformed(msg: String) -> GitError {
+        GitError::Other {
+            code: None,
+            stderr: format!("file history: malformed output ({msg})"),
+        }
+    }
+    /// A record is a commit row only when all six `LOG_FORMAT` fields are present
+    /// and the date parses; anything else is a name-status token.
+    fn commit_row(record: &str) -> Option<FileCommit> {
+        let mut f = record.splitn(6, '\x1f');
+        let (oid, _parents, author, _email, date, subject) = (
+            f.next()?,
+            f.next()?,
+            f.next()?,
+            f.next()?,
+            f.next()?,
+            f.next()?,
+        );
+        if oid.is_empty() {
+            return None;
+        }
+        Some(FileCommit {
+            oid: oid.to_owned(),
+            author: author.to_owned(),
+            date: date.parse().ok()?,
+            subject: subject.to_owned(),
+            path: String::new(),
+            renamed_from: None,
+        })
+    }
+    let mut entries: Vec<FileCommit> = Vec::new();
+    let mut current: Option<FileCommit> = None;
+    let mut it = out.split('\0');
+    while let Some(record) = it.next() {
+        let record = record.trim_start_matches(['\n', '\r']);
+        if record.is_empty() {
+            continue;
+        }
+        if let Some(row) = commit_row(record) {
+            if let Some(prev) = current.take() {
+                if prev.path.is_empty() {
+                    return Err(malformed(format!("commit {} has no file status", prev.oid)));
+                }
+                entries.push(prev);
+            }
+            current = Some(row);
+            continue;
+        }
+        let entry = current
+            .as_mut()
+            .ok_or_else(|| malformed(format!("status without a commit row: {record:?}")))?;
+        let (status, rest) = record.split_at(1);
+        let rename = match status {
+            "M" | "A" | "D" | "T" => false,
+            "R" | "C" => {
+                if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(malformed(format!(
+                        "rename status without a score: {record:?}"
+                    )));
+                }
+                true
+            }
+            _ => return Err(malformed(format!("unknown status: {record:?}"))),
+        };
+        let old = it
+            .next()
+            .ok_or_else(|| malformed("missing status path".into()))?
+            .to_owned();
+        let new = if rename {
+            it.next()
+                .ok_or_else(|| malformed("missing status path".into()))?
+                .to_owned()
+        } else {
+            old.clone()
+        };
+        entry.path = new;
+        if rename {
+            entry.renamed_from = Some(old);
+        }
+    }
+    if let Some(prev) = current {
+        if prev.path.is_empty() {
+            return Err(malformed(format!("commit {} has no file status", prev.oid)));
+        }
+        entries.push(prev);
+    }
+    Ok(entries)
+}
+
+/// The unified diff of one history entry's change to the file
+/// (docs/specs/M08 §6). A renamed file is diffed between its old and new name so
+/// the hunks survive; a root commit diffs against the empty tree.
+pub fn file_history_diff(
+    repo: &Path,
+    oid: &str,
+    path: &str,
+    renamed_from: Option<&str>,
+) -> Result<String, GitError> {
+    let raw = match renamed_from {
+        Some(old) if old != path => vec![old, path],
+        _ => vec![path],
+    };
+    let paths: Vec<String> = raw.iter().map(|p| literal(p)).collect();
+    let mut args: Vec<&str> = vec![
+        "show",
+        "--format=",
+        "--no-color",
+        "--no-ext-diff",
+        "--find-renames",
+        oid,
+        "--",
+    ];
+    args.extend(paths.iter().map(String::as_str));
+    Ok(String::from_utf8_lossy(&run(repo, &args)?).into_owned())
+}
+
+/// The content of a file at one commit (docs/specs/M08 §6, "open at revision").
+pub fn show_file(repo: &Path, oid: &str, path: &str) -> Result<Vec<u8>, GitError> {
+    run(repo, &["show", &format!("{oid}:{path}")])
+}
+
+/// Restores a working-tree file from one commit (docs/specs/M08 §6,
+/// "checkout this version").
+pub fn restore_file(repo: &Path, oid: &str, path: &str) -> Result<(), GitError> {
+    run(repo, &["restore", "--source", oid, "--", &literal(path)])?;
+    Ok(())
+}
+
 /// One changed path from `git status --porcelain=v2` (docs/specs/M07 §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
@@ -2536,5 +2713,138 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(500)); // let it spawn
         cancel.kill();
         assert!(run.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn file_history_parses_commit_rows_and_renames() {
+        // newest first; the second row renamed f.txt to g.txt
+        let rows = [
+            ("c4", "c3", "edit g", "\nM\0g.txt\0"),
+            ("c3", "c2", "rename f to g", "\nR100\0f.txt\0g.txt\0"),
+            ("c2", "c1", "edit f", "\nM\0f.txt\0"),
+            ("c1", "", "add f", "\nA\0f.txt\0"),
+        ];
+        let mut out = String::new();
+        for (oid, parents, subject, status) in &rows {
+            out.push_str(&format!(
+                "{oid}\x1f{parents}\x1fAlice\x1fa@example.com\x1f1700000000\x1f{subject}\0"
+            ));
+            out.push_str(status);
+        }
+        let entries = parse_file_history(&out).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            (entries[0].oid.as_str(), entries[0].subject.as_str()),
+            ("c4", "edit g")
+        );
+        assert_eq!(
+            (entries[0].author.as_str(), entries[0].date),
+            ("Alice", 1_700_000_000)
+        );
+        assert_eq!(entries[0].path, "g.txt");
+        assert_eq!(entries[0].renamed_from, None);
+        assert_eq!(entries[1].path, "g.txt");
+        assert_eq!(entries[1].renamed_from.as_deref(), Some("f.txt"));
+        assert_eq!(entries[2].path, "f.txt");
+        assert_eq!(entries[2].renamed_from, None);
+        assert_eq!(
+            (entries[3].subject.as_str(), entries[3].path.as_str()),
+            ("add f", "f.txt")
+        );
+        assert!(parse_file_history("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_history_rejects_malformed_output() {
+        let row = "c1\x1f\x1fA\x1fa@x\x1f1\x1fadd\0";
+        assert!(parse_file_history(&format!("{row}\nA\0f.txt\0")).is_ok());
+        assert!(parse_file_history("\nM\0f.txt\0").is_err()); // status before any commit
+        assert!(parse_file_history(&format!("{row}\nX\0f.txt\0")).is_err()); // unknown status
+        assert!(parse_file_history(&format!("{row}\nR\0f.txt\0g.txt\0")).is_err()); // rename without a score
+        assert!(parse_file_history(row).is_err()); // commit without a file status
+        assert!(parse_file_history(&format!("{row}\nA\0")).is_err()); // missing path
+    }
+
+    #[test]
+    fn file_history_follows_a_rename_in_a_real_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        std::fs::write(d.join("f.txt"), "one\n").unwrap();
+        git(d, &["add", "f.txt"]);
+        git(d, &["commit", "-q", "-m", "add f"]);
+        std::fs::write(d.join("f.txt"), "one\ntwo\n").unwrap();
+        git(d, &["add", "f.txt"]);
+        git(d, &["commit", "-q", "-m", "edit f"]);
+        git(d, &["mv", "f.txt", "g.txt"]);
+        git(d, &["commit", "-q", "-m", "rename f to g"]);
+        std::fs::write(d.join("g.txt"), "one\ntwo\nthree\n").unwrap();
+        git(d, &["add", "g.txt"]);
+        git(d, &["commit", "-q", "-m", "edit g"]);
+
+        let history = file_history(d, "g.txt", &Cancellable::default()).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|e| e.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["edit g", "rename f to g", "edit f", "add f"]
+        );
+        assert_eq!(history[1].path, "g.txt");
+        assert_eq!(history[1].renamed_from.as_deref(), Some("f.txt"));
+        assert_eq!(history[2].path, "f.txt");
+        assert_eq!(history[2].renamed_from, None);
+        assert_eq!(history[3].path, "f.txt");
+        assert!(
+            file_history(d, "nope.txt", &Cancellable::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        // the diff of each entry is its change to the file, rename included
+        let rename_diff = file_history_diff(
+            d,
+            &history[1].oid,
+            &history[1].path,
+            history[1].renamed_from.as_deref(),
+        )
+        .unwrap();
+        assert!(rename_diff.contains("rename from f.txt"), "{rename_diff}");
+        assert!(rename_diff.contains("rename to g.txt"), "{rename_diff}");
+        let edit_diff = file_history_diff(
+            d,
+            &history[2].oid,
+            &history[2].path,
+            history[2].renamed_from.as_deref(),
+        )
+        .unwrap();
+        assert!(edit_diff.contains("+++ b/f.txt"), "{edit_diff}");
+        let first_diff = file_history_diff(
+            d,
+            &history[3].oid,
+            &history[3].path,
+            history[3].renamed_from.as_deref(),
+        )
+        .unwrap();
+        assert!(first_diff.contains("+one"), "{first_diff}"); // root commit: against the empty tree
+
+        // the content of the file at each revision (under the name it had then)
+        assert_eq!(
+            show_file(d, &history[0].oid, &history[0].path).unwrap(),
+            b"one\ntwo\nthree\n"
+        );
+        assert_eq!(
+            show_file(d, &history[2].oid, &history[2].path).unwrap(),
+            b"one\ntwo\n"
+        );
+        assert_eq!(
+            show_file(d, &history[3].oid, &history[3].path).unwrap(),
+            b"one\n"
+        );
+
+        // restoring the working-tree file from an older revision
+        std::fs::write(d.join("g.txt"), "changed\n").unwrap();
+        restore_file(d, &history[1].oid, "g.txt").unwrap();
+        assert_eq!(std::fs::read(d.join("g.txt")).unwrap(), b"one\ntwo\n");
     }
 }

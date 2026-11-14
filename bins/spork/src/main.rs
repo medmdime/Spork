@@ -3,6 +3,7 @@
 mod askpass;
 mod branches;
 mod changes;
+mod file_history;
 mod history;
 mod operations;
 mod rebase;
@@ -22,7 +23,7 @@ use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Theme, ThemeRegistry, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Theme, ThemeRegistry, TitleBar, h_flex, v_flex};
 use gpui_kit::component::{Disableable as _, WindowExt as _};
 use gpui_kit::component::{resizable_panel, v_resizable};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -44,6 +45,8 @@ enum View {
     Search,
     /// Interactive rebase plan editor (rebase.rs).
     Rebase,
+    /// File history of one path (M08 §6).
+    FileHistory,
 }
 
 struct RepoView {
@@ -105,6 +108,15 @@ struct RepoView {
     search_since: Entity<InputState>,
     search_until: Entity<InputState>,
     recent_searches: Vec<SearchQuery>,
+    // file history (M08 §6)
+    file_history: Option<file_history::FileHistory>,
+    file_history_diff: Entity<DiffState>,
+    file_history_cancel: spork_git::Cancellable,
+    /// Destination field of the "Save as…" dialog (file_history.rs).
+    file_history_save: Entity<InputState>,
+    _file_history_task: Option<Task<()>>,
+    _file_history_diff_load: Option<Task<()>>,
+    _file_history_content_load: Option<Task<()>>,
 }
 
 struct Loaded {
@@ -229,6 +241,13 @@ impl RepoView {
             search_since: cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 2024-01-01")),
             search_until: cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 2024-06-30")),
             recent_searches: search::recent_searches(),
+            file_history: None,
+            file_history_diff: cx.new(|cx| DiffState::new([], cx)),
+            file_history_cancel: spork_git::Cancellable::default(),
+            file_history_save: cx.new(|cx| InputState::new(window, cx)),
+            _file_history_task: None,
+            _file_history_diff_load: None,
+            _file_history_content_load: None,
         };
         view.reload(cx);
         view
@@ -708,6 +727,10 @@ impl RepoView {
             let search = self.search_view(cx);
             return base.child(sidebar).child(panel.child(search));
         }
+        if self.view == View::FileHistory {
+            let history = self.file_history_view(cx);
+            return base.child(sidebar).child(panel.child(history));
+        }
         if count == 0 {
             return base
                 .child(sidebar)
@@ -775,11 +798,37 @@ impl RepoView {
         } else if details.patch.is_empty() {
             centered("No file changes".into())
         } else {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .child(Diff::new(&self.diff).size_full())
+            // per-file "File history" entry in the diff header (M08 §6)
+            let view = cx.entity();
+            v_flex().flex_1().min_h_0().w_full().child(
+                Diff::new(&self.diff).size_full().render_header_suffix(
+                    move |document, window, _| {
+                        let view = view.clone();
+                        let path = document.path().to_string();
+                        let click = window
+                            .listener_for::<RepoView, ClickEvent>(&view, move |this, _, _, cx| {
+                                this.start_file_history(path.clone(), cx)
+                            });
+                        div()
+                            .id("file-history-details-entry")
+                            .on_click(click)
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_0p5()
+                                    .child(
+                                        Icon::new(IconName::Calendar)
+                                            .size(px(14.))
+                                            .text_color(muted),
+                                    )
+                                    .child("File history"),
+                            )
+                    },
+                ),
+            )
         };
         pane.child(summary).child(body)
     }

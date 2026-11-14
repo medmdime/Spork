@@ -10,7 +10,7 @@ use gpui_kit::component::diff::{Diff, DiffFile};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, h_flex, resizable_panel, v_flex, v_resizable,
+    ActiveTheme as _, Disableable as _, Icon, h_flex, resizable_panel, v_flex, v_resizable,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -699,11 +699,37 @@ impl RepoView {
         } else if details.patch.is_empty() {
             centered("No file changes".into())
         } else {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .child(Diff::new(&self.search_diff).size_full())
+            // per-file "File history" entry in the diff header (M08 §6)
+            let view = cx.entity();
+            v_flex().flex_1().min_h_0().w_full().child(
+                Diff::new(&self.search_diff)
+                    .size_full()
+                    .render_header_suffix(move |document, window, _| {
+                        let view = view.clone();
+                        let path = document.path().to_string();
+                        let click = window
+                            .listener_for::<RepoView, ClickEvent>(&view, move |this, _, _, cx| {
+                                this.start_file_history(path.clone(), cx)
+                            });
+                        div()
+                            .id("file-history-search-entry")
+                            .on_click(click)
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_0p5()
+                                    .child(
+                                        Icon::new(IconName::Calendar)
+                                            .size(px(14.))
+                                            .text_color(muted),
+                                    )
+                                    .child("File history"),
+                            )
+                    }),
+            )
         };
         pane.child(crate::commit_summary(commit, details, cx))
             .child(body)
