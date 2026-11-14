@@ -1,6 +1,7 @@
 //! Spork desktop app. P1: repository sidebar (docs/specs/M03) and commit list with graph (M05).
 
 mod askpass;
+mod blame;
 mod branches;
 mod changes;
 mod file_history;
@@ -47,6 +48,8 @@ enum View {
     Rebase,
     /// File history of one path (M08 §6).
     FileHistory,
+    /// Blame of one path at one revision (M08 §5).
+    Blame,
 }
 
 struct RepoView {
@@ -117,6 +120,14 @@ struct RepoView {
     _file_history_task: Option<Task<()>>,
     _file_history_diff_load: Option<Task<()>>,
     _file_history_content_load: Option<Task<()>>,
+    // blame (M08 §5)
+    blame: Option<blame::Blame>,
+    blame_cancel: spork_git::Cancellable,
+    /// In-file search input of the blame view (blame.rs).
+    blame_search: Entity<InputState>,
+    _blame_task: Option<Task<()>>,
+    /// Kept alive so the blame search input keeps notifying (blame.rs).
+    _blame_search_events: Subscription,
 }
 
 struct Loaded {
@@ -179,6 +190,15 @@ impl RepoView {
                     InputEvent::Focus | InputEvent::Blur => {}
                 },
             );
+        // blame in-file search (M08 §5): typing re-highlights the matching lines
+        let blame_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search in the file text…"));
+        let _blame_search_events =
+            cx.subscribe(&blame_search, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) && this.view == View::Blame {
+                    cx.notify();
+                }
+            });
         let mut view = Self {
             requested,
             view: View::History,
@@ -248,6 +268,11 @@ impl RepoView {
             _file_history_task: None,
             _file_history_diff_load: None,
             _file_history_content_load: None,
+            blame: None,
+            blame_cancel: spork_git::Cancellable::default(),
+            blame_search,
+            _blame_task: None,
+            _blame_search_events,
         };
         view.reload(cx);
         view
@@ -731,6 +756,10 @@ impl RepoView {
             let history = self.file_history_view(cx);
             return base.child(sidebar).child(panel.child(history));
         }
+        if self.view == View::Blame {
+            let blame = self.blame_view(cx);
+            return base.child(sidebar).child(panel.child(blame));
+        }
         if count == 0 {
             return base
                 .child(sidebar)
@@ -798,34 +827,82 @@ impl RepoView {
         } else if details.patch.is_empty() {
             centered("No file changes".into())
         } else {
-            // per-file "File history" entry in the diff header (M08 §6)
+            // per-file "File history" and "Blame" entries in the diff header (M08 §6, M08 §5)
             let view = cx.entity();
+            // the diff header shows the path as it exists at this commit, so
+            // both entries blame / follow the file at exactly this commit
+            let (oid, short) = (
+                commit.id.clone(),
+                commit.id.chars().take(7).collect::<String>(),
+            );
             v_flex().flex_1().min_h_0().w_full().child(
                 Diff::new(&self.diff).size_full().render_header_suffix(
                     move |document, window, _| {
                         let view = view.clone();
                         let path = document.path().to_string();
+                        // per-call copies: the Blame entry's listener moves them
+                        // (the `oid` / `short` captures can only be shared, and
+                        // the first listener closure already captures `path`)
+                        let (oid, short) = (oid.clone(), short.clone());
+                        let blame_path = path.clone();
                         let click = window
                             .listener_for::<RepoView, ClickEvent>(&view, move |this, _, _, cx| {
                                 this.start_file_history(path.clone(), cx)
                             });
-                        div()
-                            .id("file-history-details-entry")
-                            .on_click(click)
-                            .cursor_pointer()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_0p5()
-                                    .child(
-                                        Icon::new(IconName::Calendar)
-                                            .size(px(14.))
-                                            .text_color(muted),
-                                    )
-                                    .child("File history"),
-                            )
+                        let blame_click = window.listener_for::<RepoView, ClickEvent>(
+                            &view,
+                            move |this, _, _, cx| {
+                                this.start_blame(
+                                    blame_path.clone(),
+                                    oid.clone(),
+                                    short.clone(),
+                                    View::History,
+                                    cx,
+                                )
+                            },
+                        );
+                        div().text_sm().child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .id("file-history-details-entry")
+                                        .on_click(click)
+                                        .cursor_pointer()
+                                        .text_color(muted)
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_0p5()
+                                                .child(
+                                                    Icon::new(IconName::Calendar)
+                                                        .size(px(14.))
+                                                        .text_color(muted),
+                                                )
+                                                .child("File history"),
+                                        ),
+                                )
+                                .child(div().text_color(muted).child("·"))
+                                .child(
+                                    div()
+                                        .id("blame-details-entry")
+                                        .on_click(blame_click)
+                                        .cursor_pointer()
+                                        .text_color(muted)
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_0p5()
+                                                .child(
+                                                    Icon::new(IconName::GitCommitHorizontal)
+                                                        .size(px(14.))
+                                                        .text_color(muted),
+                                                )
+                                                .child("Blame"),
+                                        ),
+                                ),
+                        )
                     },
                 ),
             )

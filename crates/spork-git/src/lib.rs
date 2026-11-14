@@ -686,6 +686,261 @@ pub fn restore_file(repo: &Path, oid: &str, path: &str) -> Result<(), GitError> 
     Ok(())
 }
 
+/// One line of a file at one revision, and the commit that last touched it
+/// (docs/specs/M08 §5). Consecutive lines from the same commit carry the
+/// same metadata; the UI groups them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameLine {
+    /// The 1-based line number within the file at the blamed revision.
+    pub line: usize,
+    /// The commit that last touched the line (after `-M -C` move detection).
+    pub final_oid: String,
+    /// Author of `final_oid`; "" for boundary lines whose origin is unknown.
+    pub author: String,
+    /// Author time of `final_oid`, Unix seconds; 0 if the origin is unknown.
+    pub author_date: i64,
+    /// Subject of `final_oid`; "" if the origin is unknown.
+    pub summary: String,
+}
+
+/// Blame one path at one revision (docs/specs/M08 §5):
+/// `git blame --porcelain -M -C [-w]`. The git child process is registered in
+/// `cancel` so the caller can kill it (see [`run_cancellable`]).
+pub fn blame(
+    repo: &Path,
+    rev: &str,
+    path: &str,
+    ignore_whitespace: bool,
+    cancel: &Cancellable,
+) -> Result<Vec<BlameLine>, GitError> {
+    let mut args: Vec<&str> = vec!["blame", "--porcelain", "-M", "-C"];
+    if ignore_whitespace {
+        args.push("-w");
+    }
+    // git blame takes the path as a plain path: no globbing and no pathspec
+    // magic (`:(literal)` is rejected), so the raw path is used
+    args.extend([rev, "--", path]);
+    let out = run_cancellable(repo, &args, cancel)?;
+    parse_blame_porcelain(&String::from_utf8_lossy(&out))
+}
+
+/// Parse the output of `git blame --porcelain` (docs/specs/M08 §5). A group
+/// starts with `<sha> <orig-line> <final-line> [<count>]` (count is omitted
+/// when it is 1), optionally followed by a header block (`author`,
+/// `author-time`, `summary`, …), then `<count>` content lines (tab-prefixed
+/// in modern git; `<sha> <content>`-prefixed in older git). A commit's
+/// header block is emitted at most once per blame run; later groups of the
+/// same commit (adjacent or not) omit it and inherit the recorded metadata.
+/// `boundary` marks a group whose origin is at or before the first commit of
+/// the file. Malformed output is an error, not a skip.
+pub fn parse_blame_porcelain(out: &str) -> Result<Vec<BlameLine>, GitError> {
+    fn malformed(msg: String) -> GitError {
+        GitError::Other {
+            code: None,
+            stderr: format!("blame: malformed output ({msg})"),
+        }
+    }
+    /// A group header: `<sha> <orig-line> <final-line> [<count>]` — the
+    /// count is omitted when it is 1.
+    fn group(line: &str) -> Option<(String, usize, usize)> {
+        let mut f = line.splitn(4, ' ');
+        let sha = f.next()?.to_owned();
+        if !(7..=64).contains(&sha.len()) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let orig: usize = f.next()?.parse().ok()?;
+        let fin: usize = f.next()?.parse().ok()?;
+        let count: usize = f.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+        (orig > 0 && fin > 0 && count > 0).then_some((sha, fin, count))
+    }
+    /// The content of a line, if this line is one: tab-prefixed (modern git)
+    /// or `<sha> <content>`-prefixed (older git).
+    fn content(line: &str) -> Option<&str> {
+        if let Some(rest) = line.strip_prefix('\t') {
+            return Some(rest);
+        }
+        let bytes = line.as_bytes();
+        for n in [64, 40] {
+            if bytes.len() >= n
+                && bytes[..n].iter().all(|b| b.is_ascii_hexdigit())
+                && (bytes.len() == n || bytes[n] == b' ')
+            {
+                return Some(if bytes.len() == n { "" } else { &line[n + 1..] });
+            }
+        }
+        None
+    }
+    /// One group as it accumulates: its content lines, and the header block
+    /// it carried (absent when the commit repeats the previous group).
+    #[derive(Default)]
+    struct Group {
+        oid: String,
+        fin: usize,
+        count: usize,
+        rows: Vec<usize>,
+        author: Option<String>,
+        date: Option<i64>,
+        summary: Option<String>,
+    }
+    /// A group is complete once its content lines are in; its metadata is
+    /// its own header block, or — when git omitted it because this commit's
+    /// header was already emitted earlier in the output (the header is
+    /// emitted at most once per commit) — the metadata recorded for that
+    /// commit.
+    fn finish(
+        g: Group,
+        seen: &mut std::collections::HashMap<String, (String, i64, String)>,
+    ) -> Result<Vec<BlameLine>, GitError> {
+        let zero = g.oid.bytes().all(|b| b == b'0');
+        let meta = if zero {
+            (String::new(), 0, String::new())
+        } else if g.author.is_some() || g.date.is_some() || g.summary.is_some() {
+            // git emits the whole block at once; a partial one is malformed
+            let (author, date, summary) = (
+                g.author
+                    .ok_or_else(|| malformed(format!("partial header for {}", g.oid)))?,
+                g.date
+                    .ok_or_else(|| malformed(format!("partial header for {}", g.oid)))?,
+                g.summary
+                    .ok_or_else(|| malformed(format!("partial header for {}", g.oid)))?,
+            );
+            let meta = (author, date, summary);
+            seen.insert(g.oid.clone(), meta.clone());
+            meta
+        } else {
+            seen.get(&g.oid)
+                .cloned()
+                .ok_or_else(|| malformed(format!("header omitted for unseen commit {}", g.oid)))?
+        };
+        let (author, date, summary) = meta;
+        Ok(g.rows
+            .into_iter()
+            .map(|line| BlameLine {
+                line,
+                final_oid: g.oid.clone(),
+                author: author.clone(),
+                author_date: date,
+                summary: summary.clone(),
+            })
+            .collect())
+    }
+
+    let mut lines: Vec<BlameLine> = Vec::new();
+    let mut current: Option<Group> = None;
+    let mut seen: std::collections::HashMap<String, (String, i64, String)> =
+        std::collections::HashMap::new();
+    for raw in out.lines() {
+        if raw.is_empty() {
+            continue;
+        }
+        // checked before content lines: a group header (`<sha> <orig> <final>
+        // [<count>]`) would otherwise look like an older-git content line
+        if let Some((oid, fin, count)) = group(raw) {
+            if current.is_some() {
+                return Err(malformed(
+                    "group header before the previous group is complete".into(),
+                ));
+            }
+            current = Some(Group {
+                oid,
+                fin,
+                count,
+                ..Default::default()
+            });
+            continue;
+        }
+        if let Some(_text) = content(raw) {
+            let Some(g) = current.as_mut() else {
+                return Err(malformed("content line before any group".into()));
+            };
+            if g.rows.len() >= g.count {
+                return Err(malformed(format!(
+                    "more content lines than group {} declares",
+                    g.oid
+                )));
+            }
+            g.rows.push(g.fin + g.rows.len());
+            // the group is finished once its content lines are in
+            if let Some(g) = current.take() {
+                if g.rows.len() == g.count {
+                    lines.extend(finish(g, &mut seen)?);
+                } else {
+                    current = Some(g);
+                }
+            }
+            continue;
+        }
+        // a header-block line for the in-progress group
+        let g = current
+            .as_mut()
+            .ok_or_else(|| malformed(format!("header line outside a group: {raw:?}")))?;
+        if !g.rows.is_empty() {
+            return Err(malformed(format!(
+                "header line after the group's content lines: {raw:?}"
+            )));
+        }
+        if raw == "boundary" {
+            continue;
+        }
+        let (key, value) = raw
+            .split_once(' ')
+            .ok_or_else(|| malformed(format!("unrecognized header line: {raw:?}")))?;
+        match key {
+            "author" => g.author = Some(value.to_owned()),
+            "author-time" => {
+                g.date = Some(
+                    value
+                        .parse()
+                        .map_err(|_| malformed(format!("bad author-time: {value:?}")))?,
+                );
+            }
+            "summary" => g.summary = Some(value.to_owned()),
+            // carried by the format, not used by the view
+            "author-mail" | "author-tz" | "committer" | "committer-mail" | "committer-time"
+            | "committer-tz" | "filename" | "previous" => {}
+            _ => return Err(malformed(format!("unknown header key: {raw:?}"))),
+        }
+    }
+    if let Some(g) = current {
+        if g.rows.len() != g.count {
+            return Err(malformed(format!(
+                "group {} has {} of {} content lines",
+                g.oid,
+                g.rows.len(),
+                g.count
+            )));
+        }
+        lines.extend(finish(g, &mut seen)?);
+    }
+    Ok(lines)
+}
+
+/// The commit ids in `oids` that have no parent (first commits, M08 §5):
+/// `git rev-list --no-walk --parents` prints `<oid> <parents…>` per commit,
+/// so an id with no parent is exactly one id per line.
+pub fn root_commits(repo: &Path, oids: &[&str]) -> Result<Vec<String>, GitError> {
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let args: Vec<&str> = std::iter::once("rev-list")
+        .chain(["--no-walk", "--parents"])
+        .chain(oids.iter().copied())
+        .collect();
+    let out = run(repo, &args)?;
+    Ok(parse_root_commits(&String::from_utf8_lossy(&out), oids))
+}
+
+/// Split `git rev-list --no-walk --parents` output into the ids without a
+/// parent. Lines with no parent (exactly one id) are roots; lines with
+/// parents are not.
+pub fn parse_root_commits(out: &str, oids: &[&str]) -> Vec<String> {
+    out.lines()
+        .filter(|line| line.split_whitespace().count() == 1)
+        .map(str::to_owned)
+        .filter(|oid| oids.iter().any(|o| *o == oid))
+        .collect()
+}
+
 /// One changed path from `git status --porcelain=v2` (docs/specs/M07 §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
@@ -1647,6 +1902,37 @@ mod tests {
             .unwrap()
             .success();
         assert!(ok, "git {args:?} failed");
+    }
+
+    /// Same as `git`, but with a distinct author/committer name and date so
+    /// tests can attribute lines to specific identities.
+    fn git_as(dir: &Path, name: &str, date: &str, args: &[&str]) {
+        let email = format!("{name}@spork.invalid");
+        let ok = Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
+            .env("GIT_AUTHOR_NAME", name)
+            .env("GIT_AUTHOR_EMAIL", &email)
+            .env("GIT_COMMITTER_NAME", name)
+            .env("GIT_COMMITTER_EMAIL", &email)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// The oid of `HEAD` in `dir`.
+    fn head(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse HEAD failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
     #[test]
@@ -2846,5 +3132,147 @@ mod tests {
         std::fs::write(d.join("g.txt"), "changed\n").unwrap();
         restore_file(d, &history[1].oid, "g.txt").unwrap();
         assert_eq!(std::fs::read(d.join("g.txt")).unwrap(), b"one\ntwo\n");
+    }
+
+    #[test]
+    fn blame_parses_porcelain_groups() {
+        let a = "6b2c8a1f00000000000000000000000000000000";
+        let b = "7d9e2b3a00000000000000000000000000000000";
+        let out = format!(
+            "{a} 1 1 2\n\
+             author Alice\n\
+             author-time 1735689600\n\
+             summary first commit\n\
+             \tone\n\
+             \ttwo\n\
+             {b} 2 3\n\
+             author Bob\n\
+             author-time 1748736000\n\
+             summary second commit\n\
+             \tthree\n\
+             {a} 4 4\n\
+             \tfour\n\
+             0000000000000000000000000000000000000000 1 5\n\
+             boundary\n\
+             \tfive\n"
+        );
+        let lines = parse_blame_porcelain(&out).unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|l| (l.line, l.final_oid.as_str(), l.author.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (1, a, "Alice"),
+                (2, a, "Alice"),
+                (3, b, "Bob"),
+                // commit A repeats non-adjacently: its header was already
+                // emitted, so this group inherits A's recorded metadata
+                (4, a, "Alice"),
+                (5, "0000000000000000000000000000000000000000", ""),
+            ]
+        );
+        assert_eq!(lines[0].author_date, 1735689600);
+        assert_eq!(lines[3].summary, "first commit"); // inherited from A
+        assert_eq!(lines[3].author_date, 1735689600);
+        assert_eq!(lines[2].summary, "second commit");
+        assert_eq!(lines[4].author_date, 0);
+        assert_eq!(lines[4].summary, "");
+    }
+
+    #[test]
+    fn blame_rejects_malformed_output() {
+        let a = "6b2c8a1f00000000000000000000000000000000";
+        // content before any group
+        assert!(parse_blame_porcelain("\tone\n").is_err());
+        // a group that declares more lines than it has
+        assert!(parse_blame_porcelain(&format!("{a} 1 1 2\n\tone\n")).is_err());
+        // a group header while the previous group is still open
+        assert!(parse_blame_porcelain(&format!("{a} 1 1 2\n\tone\n{a} 2 2\n\ttwo\n")).is_err());
+        // a header key outside a group
+        assert!(parse_blame_porcelain("author Alice\n").is_err());
+        // an unknown header key
+        assert!(parse_blame_porcelain(&format!("{a} 1 1 1\nbogus x\n\tone\n")).is_err());
+        // a header omitted for a commit whose header was never emitted
+        let b = "7d9e2b3a00000000000000000000000000000000";
+        assert!(parse_blame_porcelain(&format!("{b} 1 1 1\n\tone\n")).is_err());
+        // a partial header block (git emits all or nothing)
+        assert!(parse_blame_porcelain(&format!("{a} 1 1 1\nauthor Alice\n\tone\n")).is_err());
+    }
+
+    #[test]
+    fn blames_a_multi_author_file_in_a_real_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        std::fs::write(d.join("f.txt"), "a\nb\nc\n").unwrap();
+        git_as(d, "Alice", "2025-01-01T00:00:00Z", &["add", "f.txt"]);
+        git_as(
+            d,
+            "Alice",
+            "2025-01-01T00:00:00Z",
+            &["commit", "-q", "-m", "add f"],
+        );
+        let alice = head(d);
+        std::fs::write(d.join("f.txt"), "a\nb2\nc\n").unwrap();
+        git_as(d, "Bob", "2025-06-01T00:00:00Z", &["add", "f.txt"]);
+        git_as(
+            d,
+            "Bob",
+            "2025-06-01T00:00:00Z",
+            &["commit", "-q", "-m", "tweak line 2"],
+        );
+        let bob = head(d);
+        std::fs::write(d.join("f.txt"), "a2\nb2\nc\nd\n").unwrap();
+        git_as(d, "Carol", "2026-11-01T00:00:00Z", &["add", "f.txt"]);
+        git_as(
+            d,
+            "Carol",
+            "2026-11-01T00:00:00Z",
+            &["commit", "-q", "-m", "tweak line 1, add line 4"],
+        );
+        let carol = head(d);
+
+        let lines = blame(d, &carol, "f.txt", false, &Cancellable::default()).unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|l| (l.line, l.final_oid.as_str(), l.author.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (1, carol.as_str(), "Carol"),
+                (2, bob.as_str(), "Bob"),
+                (3, alice.as_str(), "Alice"),
+                (4, carol.as_str(), "Carol"),
+            ]
+        );
+
+        // the same blame with whitespace ignored
+        let lax = blame(d, &carol, "f.txt", true, &Cancellable::default()).unwrap();
+        assert_eq!(lax.len(), 4);
+
+        // paths with glob characters are passed through as-is: blame takes a
+        // plain path (no globbing, no pathspec magic)
+        std::fs::write(d.join("g*.txt"), "glob\n").unwrap();
+        git_as(d, "Bob", "2025-06-01T00:00:00Z", &["add", "g*.txt"]);
+        git_as(
+            d,
+            "Bob",
+            "2025-06-01T00:00:00Z",
+            &["commit", "-q", "-m", "add glob"],
+        );
+        let glob = blame(d, &head(d), "g*.txt", false, &Cancellable::default()).unwrap();
+        assert_eq!(glob.len(), 1);
+        assert_eq!(glob[0].author, "Bob");
+
+        // only the first commit has no parent
+        assert_eq!(
+            root_commits(d, &[&alice, &bob, &carol]).unwrap(),
+            vec![alice]
+        );
+        assert!(root_commits(d, &[]).unwrap().is_empty());
+
+        // a missing path is an error, not a parse result
+        assert!(blame(d, &carol, "nope.txt", false, &Cancellable::default()).is_err());
     }
 }

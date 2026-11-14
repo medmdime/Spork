@@ -573,5 +573,12 @@ impl RepoView {
                         cx.listener(move |this, _, window, cx| this.checkout_revision(window, cx)),
                     ),
             )
+            .child(
+                Button::new("file-history-blame")
+                    .ghost()
+                    .icon(IconName::GitCommitHorizontal)
+                    .tooltip("Blame this file at the selected revision")
+                    .on_click(cx.listener(move |this, _, _, cx| this.blame_at_revision(cx))),
+            )
     }
 }
