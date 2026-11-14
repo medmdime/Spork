@@ -159,6 +159,8 @@ struct Loaded {
     gitflow: Option<spork_git::gitflow::GitflowConfig>,
     /// A finish interrupted by conflicts, possibly in a previous session (M13 §3).
     paused_finish: Option<spork_git::gitflow::FinishState>,
+    /// The repository's default branch (M13 §4), best-effort; "main" when unknown.
+    default_branch: String,
 }
 
 /// Deep-search state (M05 §5): results replace the history list while the Search view is active.
@@ -487,6 +489,7 @@ fn load(path: &Path) -> Result<Loaded, GitError> {
         // best effort: a missing / broken config or state file just hides the menu entry / banner
         gitflow: spork_git::gitflow::gitflow_config(&root),
         paused_finish: spork_git::gitflow::gitflow_finish_state(&root),
+        default_branch: spork_git::lean::default_branch(&root),
         root,
     })
 }

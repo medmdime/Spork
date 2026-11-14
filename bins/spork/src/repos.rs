@@ -241,8 +241,15 @@ impl RepoView {
                     .item(PopupMenuItem::separator());
                 let gitflow_view = view.clone();
                 menu.submenu("Git Flow", window, cx, move |menu, _window, cx| {
-                    let (config, current) = gitflow_view.read(cx).gitflow_menu_state();
-                    crate::gitflow::gitflow_submenu(menu, config, current, gitflow_view.clone())
+                    let (config, current, default_branch) =
+                        gitflow_view.read(cx).gitflow_menu_state();
+                    crate::gitflow::gitflow_submenu(
+                        menu,
+                        config,
+                        current,
+                        default_branch,
+                        gitflow_view.clone(),
+                    )
                 })
             })
     }
