@@ -101,6 +101,10 @@ impl RepoView {
         self.view = View::History;
         self._watcher = None;
         self.gitflow_cancel.kill();
+        self.lfs_cancel.kill();
+        self._lfs_task = None;
+        self._lfs_status_task = None;
+        self.lfs_status = None;
         self.reload(cx);
     }
 
@@ -240,7 +244,7 @@ impl RepoView {
                     .item(action("New repository…", RepoView::new_repo_dialog))
                     .item(PopupMenuItem::separator());
                 let gitflow_view = view.clone();
-                menu.submenu("Git Flow", window, cx, move |menu, _window, cx| {
+                let menu = menu.submenu("Git Flow", window, cx, move |menu, _window, cx| {
                     let (config, current, default_branch) =
                         gitflow_view.read(cx).gitflow_menu_state();
                     crate::gitflow::gitflow_submenu(
@@ -250,6 +254,11 @@ impl RepoView {
                         default_branch,
                         gitflow_view.clone(),
                     )
+                });
+                let lfs_view = view.clone();
+                menu.submenu("Git LFS", window, cx, move |menu, _window, cx| {
+                    let state = lfs_view.read(cx).lfs_menu_state();
+                    crate::lfs::lfs_submenu(menu, state, lfs_view.clone())
                 })
             })
     }

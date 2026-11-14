@@ -7,6 +7,7 @@ mod changes;
 mod file_history;
 mod gitflow;
 mod history;
+mod lfs;
 mod operations;
 mod rebase;
 mod repos;
@@ -51,6 +52,8 @@ enum View {
     FileHistory,
     /// Blame of one path at one revision (M08 §5).
     Blame,
+    /// Git LFS files with per-row lock/unlock (M14 §3–§4).
+    Lfs,
 }
 
 struct RepoView {
@@ -143,6 +146,13 @@ struct RepoView {
     /// A git-flow init / start / finish / resume is running.
     gitflow_busy: bool,
     _gitflow_task: Option<Task<()>>,
+    // git lfs (M14 §1–§5, lfs.rs)
+    /// Kills an in-flight LFS background git call on a repo switch.
+    lfs_cancel: spork_git::Cancellable,
+    _lfs_task: Option<Task<()>>,
+    _lfs_status_task: Option<Task<()>>,
+    /// The LFS status table (M14 §3); `None` outside the LFS view.
+    lfs_status: Option<lfs::LfsStatus>,
 }
 
 struct Loaded {
@@ -161,6 +171,18 @@ struct Loaded {
     paused_finish: Option<spork_git::gitflow::FinishState>,
     /// The repository's default branch (M13 §4), best-effort; "main" when unknown.
     default_branch: String,
+    // Git LFS (M14 §1–§5), best-effort like the Git Flow facts above.
+    /// The repository tracks files with Git LFS.
+    lfs_in_use: bool,
+    /// The LFS filters are installed for this repository.
+    lfs_hooks: bool,
+    /// The `filter=lfs` patterns in the working-tree `.gitattributes` (M14
+    /// follow-up badges); stored now so the follow-up does not touch this
+    /// load path again.
+    #[allow(dead_code)]
+    lfs_patterns: Vec<String>,
+    /// The `git-lfs` extension is installed; a process-global check, cached once.
+    lfs_installed: bool,
 }
 
 /// Deep-search state (M05 §5): results replace the history list while the Search view is active.
@@ -306,6 +328,10 @@ impl RepoView {
             gitflow_cancel: spork_git::Cancellable::default(),
             gitflow_busy: false,
             _gitflow_task: None,
+            lfs_cancel: spork_git::Cancellable::default(),
+            _lfs_task: None,
+            _lfs_status_task: None,
+            lfs_status: None,
         };
         view.reload(cx);
         view
@@ -490,6 +516,14 @@ fn load(path: &Path) -> Result<Loaded, GitError> {
         gitflow: spork_git::gitflow::gitflow_config(&root),
         paused_finish: spork_git::gitflow::gitflow_finish_state(&root),
         default_branch: spork_git::lean::default_branch(&root),
+        // best-effort LFS facts (M14): a missing gitattributes file just leaves the patterns empty
+        lfs_in_use: spork_git::lfs::lfs_in_use(&root),
+        lfs_hooks: spork_git::lfs::lfs_hooks_installed(&root),
+        lfs_patterns: {
+            let text = std::fs::read_to_string(root.join(".gitattributes")).unwrap_or_default();
+            spork_git::lfs::lfs_patterns(&text)
+        },
+        lfs_installed: lfs::lfs_installed_cached(),
         root,
     })
 }
@@ -777,7 +811,8 @@ impl RepoView {
             .overflow_hidden();
         let panel = panel
             .children(self.op_banner(cx))
-            .children(self.gitflow_finish_banner(cx));
+            .children(self.gitflow_finish_banner(cx))
+            .children(self.lfs_banner(cx));
 
         if self.view == View::Rebase {
             let plan = self.rebase_view(cx);
@@ -798,6 +833,10 @@ impl RepoView {
         if self.view == View::Blame {
             let blame = self.blame_view(cx);
             return base.child(sidebar).child(panel.child(blame));
+        }
+        if self.view == View::Lfs {
+            let lfs = self.lfs_status_view(cx);
+            return base.child(sidebar).child(panel.child(lfs));
         }
         if count == 0 {
             return base
