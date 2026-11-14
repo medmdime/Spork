@@ -274,17 +274,33 @@ pub fn gitflow_start(
     Ok(name)
 }
 
-/// Options for `gitflow_finish` (M13 §3).
+/// Options for `gitflow_finish` (M13 §3). The release/hotfix-only fields
+/// (`tag_message`, `sign_tag`, `push_after`, `no_back_merge`) carry
+/// `#[serde(default)]` so state files written before they existed still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinishOptions {
     /// Rebase the feature branch onto the development branch before merging.
     pub rebase_before_merge: bool,
     /// Merge with `--no-ff` (keep an explicit merge commit).
     pub no_fast_forward: bool,
-    /// Delete the feature branch after merging (git-flow default).
+    /// Delete the branch after merging (git-flow default).
     pub delete_branch: bool,
     /// Also delete the branch on its upstream remote.
     pub delete_remote: bool,
+    /// Release/hotfix: message for the annotated version tag (feature ignores it).
+    #[serde(default)]
+    pub tag_message: String,
+    /// Release/hotfix: GPG-sign the version tag (feature ignores it).
+    #[serde(default)]
+    pub sign_tag: bool,
+    /// Release/hotfix: push master, the back-merge target and the tag to the branch's
+    /// upstream remote afterwards (feature ignores it).
+    #[serde(default)]
+    pub push_after: bool,
+    /// Release/hotfix: skip the back-merge into develop / the newest release branch
+    /// (feature ignores it).
+    #[serde(default)]
+    pub no_back_merge: bool,
 }
 
 impl Default for FinishOptions {
@@ -294,6 +310,10 @@ impl Default for FinishOptions {
             no_fast_forward: false,
             delete_branch: true,
             delete_remote: false,
+            tag_message: String::new(),
+            sign_tag: false,
+            push_after: false,
+            no_back_merge: false,
         }
     }
 }
@@ -318,13 +338,29 @@ pub enum FinishResult {
     Conflicts { step: usize },
 }
 
-/// Human-readable label for a saved finish step (for the banner).
-pub fn finish_step_label(step: usize) -> &'static str {
-    match step {
-        1 => "rebase onto develop",
-        2 => "switch to develop",
-        3 => "merge into develop",
-        _ => "cleaning up branches",
+/// Human-readable label for a saved finish step (for the banner). `kind` is the state
+/// file's kind tag (`"feature"`, `"release"`, `"hotfix"`).
+pub fn finish_step_label(kind: &str, step: usize) -> &'static str {
+    match (kind, step) {
+        ("feature", 1) => "rebase onto develop",
+        ("feature", 2) => "switch to develop",
+        ("feature", 3) => "merge into develop",
+        ("feature", _) => "cleaning up branches",
+        ("release", 1) => "switch to master",
+        ("release", 2) => "merge into master",
+        ("release", 3) => "tag release",
+        ("release", 4) => "switch to develop",
+        ("release", 5) => "back-merge into develop",
+        ("release", 6) => "delete branch",
+        ("release", 7) => "push",
+        ("hotfix", 1) => "switch to master",
+        ("hotfix", 2) => "merge into master",
+        ("hotfix", 3) => "tag hotfix",
+        ("hotfix", 4) => "switch to back-merge target",
+        ("hotfix", 5) => "back-merge into release/develop",
+        ("hotfix", 6) => "delete branch",
+        ("hotfix", 7) => "push",
+        _ => "finishing",
     }
 }
 
@@ -368,10 +404,12 @@ pub fn gitflow_abort_finish(repo: &Path) -> Result<(), GitError> {
     }
 }
 
-/// Finishes the feature branch we are on (M13 §3): rebase (optional), switch to develop,
-/// merge, delete the branch. Each step is a separate git call and progress is saved after
-/// each one, so an interrupted run can be resumed with `gitflow_resume_finish`.
+/// Finishes the branch we are on (M13 §3). Feature: rebase (optional), switch to develop,
+/// merge, delete the branch. Release/hotfix: merge into master, tag, back-merge, delete
+/// the branch, optionally push. Each step is a separate git call and progress is saved
+/// after each one, so an interrupted run can be resumed with `gitflow_resume_finish`.
 pub fn gitflow_finish(
+    kind: FlowKind,
     repo: &Path,
     options: &FinishOptions,
     cancel: &Cancellable,
@@ -379,99 +417,169 @@ pub fn gitflow_finish(
     let config = gitflow_config(repo).ok_or_else(not_initialized)?;
     let out = run(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let name = String::from_utf8_lossy(&out).trim_end().to_owned();
-    if !name.starts_with(config.feature.as_str()) {
+    let prefix = kind.prefix(&config);
+    if !name.starts_with(prefix) {
         return Err(GitError::Other {
             code: None,
-            stderr: format!("{name} is not a {} branch", config.feature),
+            stderr: format!("{name} is not a {prefix} branch"),
         });
     }
     save_finish_state(
         repo,
         &FinishState {
-            kind: "feature".to_owned(),
+            kind: kind_name(kind).to_owned(),
             name: name.clone(),
             step: 1,
             options: options.clone(),
         },
     )?;
-    finish_steps(repo, &name, 1, options, cancel)
+    finish_steps(kind, repo, &name, 1, options, cancel)
 }
 
 /// Continues an interrupted finish from its saved step (M13 §3). The current branch is not
-/// consulted — the saved state is.
+/// consulted — the saved state is. Dispatches on the state file's `kind`.
 pub fn gitflow_resume_finish(repo: &Path, cancel: &Cancellable) -> Result<FinishResult, GitError> {
     let state = gitflow_finish_state(repo).ok_or_else(|| GitError::Other {
         code: None,
         stderr: "no git-flow finish in progress".to_owned(),
     })?;
-    if state.kind != "feature" {
-        return Err(GitError::Other {
-            code: None,
-            stderr: format!("unknown git-flow finish kind: {}", state.kind),
-        });
-    }
-    finish_steps(repo, &state.name, state.step, &state.options, cancel)
+    let kind = match state.kind.as_str() {
+        "feature" => FlowKind::Feature,
+        "release" => FlowKind::Release,
+        "hotfix" => FlowKind::Hotfix,
+        other => {
+            return Err(GitError::Other {
+                code: None,
+                stderr: format!("unknown git-flow finish kind: {other}"),
+            });
+        }
+    };
+    finish_steps(kind, repo, &state.name, state.step, &state.options, cancel)
 }
 
 /// Runs the finish steps from `step` onward (1-based), saving progress after each one.
+/// Steps are idempotent on re-run, so a resumed run safely repeats the step that was
+/// interrupted.
 fn finish_steps(
+    kind: FlowKind,
     repo: &Path,
     name: &str,
     mut step: usize,
     options: &FinishOptions,
     cancel: &Cancellable,
 ) -> Result<FinishResult, GitError> {
-    let develop = gitflow_config(repo).ok_or_else(not_initialized)?.develop;
+    let config = gitflow_config(repo).ok_or_else(not_initialized)?;
+    let kind_str = kind_name(kind);
+    let max_step = match kind {
+        FlowKind::Feature => 4,
+        FlowKind::Release | FlowKind::Hotfix => 7,
+    };
+    // The remote a release/hotfix branch was deleted from (step 6), captured before
+    // `git push --delete` prunes its tracking ref, so step 7 can still push to it.
+    let mut deleted_from: Option<String> = None;
     loop {
-        let conflicted = match step {
-            1 => {
-                if options.rebase_before_merge {
-                    match rebase_onto_develop(repo, name, &develop, cancel)? {
-                        Outcome::Conflicts => true,
-                        Outcome::Done => false,
+        let conflicted = match kind {
+            FlowKind::Feature => match step {
+                1 => {
+                    if options.rebase_before_merge {
+                        match rebase_onto_develop(repo, name, &config.develop, cancel)? {
+                            Outcome::Conflicts => true,
+                            Outcome::Done => false,
+                        }
+                    } else {
+                        false
                     }
-                } else {
+                }
+                2 => {
+                    run_cancellable(repo, &["switch", &config.develop], cancel)?;
                     false
                 }
-            }
-            2 => {
-                run_cancellable(repo, &["switch", &develop], cancel)?;
-                false
-            }
-            3 => match merge_feature(repo, name, options.no_fast_forward, cancel)? {
-                Outcome::Conflicts => true,
-                Outcome::Done => false,
+                3 => match merge_feature(repo, name, options.no_fast_forward, cancel)? {
+                    Outcome::Conflicts => true,
+                    Outcome::Done => false,
+                },
+                4 => {
+                    delete_feature_branch(repo, name, options, cancel)?;
+                    false
+                }
+                _ => return unknown_step(step),
             },
-            4 => {
-                delete_feature_branch(repo, name, options, cancel)?;
-                false
-            }
-            _ => {
-                return Err(GitError::Other {
-                    code: None,
-                    stderr: format!("unknown git-flow finish step {step}"),
-                });
-            }
+            FlowKind::Release | FlowKind::Hotfix => match step {
+                1 => {
+                    run_cancellable(repo, &["switch", &config.master], cancel)?;
+                    false
+                }
+                2 => match merge_feature(repo, name, true, cancel)? {
+                    Outcome::Conflicts => true,
+                    Outcome::Done => false,
+                },
+                3 => {
+                    create_release_tag(repo, &config, kind, name, options, cancel)?;
+                    false
+                }
+                4 => {
+                    if !options.no_back_merge {
+                        let target = back_merge_target(kind, repo, &config)?;
+                        run_cancellable(repo, &["switch", &target], cancel)?;
+                    }
+                    false
+                }
+                5 => {
+                    if options.no_back_merge {
+                        false
+                    } else {
+                        let tag = release_tag_name(&config, kind, name);
+                        match merge_feature(repo, &tag, true, cancel)? {
+                            Outcome::Conflicts => true,
+                            Outcome::Done => false,
+                        }
+                    }
+                }
+                6 => {
+                    deleted_from = delete_release_branch(repo, name, options, cancel)?;
+                    false
+                }
+                7 => {
+                    push_release_artifacts(
+                        repo,
+                        &config,
+                        kind,
+                        name,
+                        options,
+                        cancel,
+                        deleted_from.as_deref(),
+                    )?;
+                    false
+                }
+                _ => return unknown_step(step),
+            },
         };
         if conflicted {
             // The state file already records `step` as the next step.
             return Ok(FinishResult::Conflicts { step });
         }
         step += 1;
-        if step > 4 {
+        if step > max_step {
             std::fs::remove_file(state_file(repo)?).ok();
             return Ok(FinishResult::Done);
         }
         save_finish_state(
             repo,
             &FinishState {
-                kind: "feature".to_owned(),
+                kind: kind_str.to_owned(),
                 name: name.to_owned(),
                 step,
                 options: options.clone(),
             },
         )?;
     }
+}
+
+fn unknown_step(step: usize) -> Result<FinishResult, GitError> {
+    Err(GitError::Other {
+        code: None,
+        stderr: format!("unknown git-flow finish step {step}"),
+    })
 }
 
 /// Step 1: rebase the feature branch onto develop. Re-runs a paused rebase as-is.
@@ -569,6 +677,206 @@ fn tracking_remote(repo: &Path, name: &str) -> Result<Option<String>, GitError> 
     }
 }
 
+/// The kind tag stored in the finish state file (`"feature"`, `"release"`, `"hotfix"`).
+fn kind_name(kind: FlowKind) -> &'static str {
+    match kind {
+        FlowKind::Feature => "feature",
+        FlowKind::Release => "release",
+        FlowKind::Hotfix => "hotfix",
+    }
+}
+
+/// The annotated version tag created when finishing a release/hotfix (M13 §3):
+/// `<versiontag><version>` — branch `release/1.2.3` becomes tag `v1.2.3`.
+fn release_tag_name(config: &GitflowConfig, kind: FlowKind, name: &str) -> String {
+    let version = name.strip_prefix(kind.prefix(config)).unwrap_or(name);
+    config.versiontag.to_owned() + version
+}
+
+/// The back-merge target for a release/hotfix finish (M13 §3): develop for a release, the
+/// newest release branch for a hotfix — falling back to develop when no release branch
+/// exists (the git-flow rule).
+fn back_merge_target(
+    kind: FlowKind,
+    repo: &Path,
+    config: &GitflowConfig,
+) -> Result<String, GitError> {
+    match kind {
+        FlowKind::Release | FlowKind::Feature => Ok(config.develop.clone()),
+        FlowKind::Hotfix => {
+            Ok(latest_release_branch(repo, &config.release)
+                .unwrap_or_else(|| config.develop.clone()))
+        }
+    }
+}
+
+/// The newest release branch (by committer date) under the configured prefix, if any
+/// (M13 §3: a hotfix back-merges into it).
+pub fn latest_release_branch(repo: &Path, prefix: &str) -> Option<String> {
+    let out = run(
+        repo,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            &format!("refs/heads/{prefix}"),
+        ],
+    )
+    .ok()?;
+    String::from_utf8_lossy(&out)
+        .lines()
+        .map(str::trim_end)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// Step 3 (release/hotfix): create the annotated version tag, skipping it when it already
+/// exists so a resumed re-run of the step is a no-op (M13 §3).
+fn create_release_tag(
+    repo: &Path,
+    config: &GitflowConfig,
+    kind: FlowKind,
+    name: &str,
+    options: &FinishOptions,
+    cancel: &Cancellable,
+) -> Result<(), GitError> {
+    let tag = release_tag_name(config, kind, name);
+    if run(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/tags/{tag}"),
+        ],
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    let mut args = vec!["tag", "--annotate"];
+    if options.sign_tag {
+        args.push("-s");
+    }
+    args.push("--message");
+    args.push(options.tag_message.as_str());
+    args.push(tag.as_str());
+    args.push(name);
+    run_cancellable(repo, &args, cancel).map(drop)
+}
+
+/// Step 6 (release/hotfix): delete the finished branch locally (when the option is set)
+/// and from its upstream remote when it had one (M13 §3). The tracking remote is read
+/// before the local deletion — `git branch -d` removes the branch's config section.
+/// Returns the remote the branch was deleted from so the push step (7) can still reach it:
+/// `git push --delete` prunes the local tracking ref, so after the deletion the upstream
+/// is otherwise undiscoverable.
+fn delete_release_branch(
+    repo: &Path,
+    name: &str,
+    options: &FinishOptions,
+    cancel: &Cancellable,
+) -> Result<Option<String>, GitError> {
+    if !options.delete_branch {
+        return Ok(None);
+    }
+    let remote = tracking_remote(repo, name)?.filter(|remote| {
+        run(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{remote}/{name}"),
+            ],
+        )
+        .is_ok()
+    });
+    if run(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{name}"),
+        ],
+    )
+    .is_ok()
+    {
+        run_cancellable(repo, &["branch", "-d", name], cancel)?;
+    }
+    if let Some(remote) = &remote {
+        run_cancellable(repo, &["push", remote, "--delete", name], cancel)?;
+    }
+    Ok(remote)
+}
+
+/// Step 7 (release/hotfix): when `push_after` is set, push master, the back-merge target
+/// and the version tag to the branch's upstream remote (M13 §3). A clean no-op when the
+/// option is off or there is no remote to push to. `deleted_from` is the remote step 6
+/// deleted the branch from (already read, before `git push --delete` pruned the tracking
+/// ref); when it is absent the upstream is re-derived from the still-existing branch.
+fn push_release_artifacts(
+    repo: &Path,
+    config: &GitflowConfig,
+    kind: FlowKind,
+    name: &str,
+    options: &FinishOptions,
+    cancel: &Cancellable,
+    deleted_from: Option<&str>,
+) -> Result<(), GitError> {
+    if !options.push_after {
+        return Ok(());
+    }
+    let remote = match deleted_from {
+        Some(remote) => Some(remote.to_owned()),
+        None => push_remote(repo, name)?,
+    };
+    let Some(remote) = remote else {
+        return Ok(());
+    };
+    run_cancellable(repo, &["push", &remote, &config.master], cancel)?;
+    let target = back_merge_target(kind, repo, config)?;
+    run_cancellable(repo, &["push", &remote, &target], cancel)?;
+    let tag = release_tag_name(config, kind, name);
+    run_cancellable(
+        repo,
+        &["push", &remote, &format!("refs/tags/{tag}")],
+        cancel,
+    )?;
+    Ok(())
+}
+
+/// The remote to push release artifacts to: the branch's upstream while it still has one,
+/// else — after the branch was deleted, when the `branch.<name>` config is gone — the
+/// remote whose tracking ref for the branch still exists. `None` when neither is found.
+fn push_remote(repo: &Path, name: &str) -> Result<Option<String>, GitError> {
+    if let Some(remote) = tracking_remote(repo, name)? {
+        return Ok(Some(remote));
+    }
+    let out = run(repo, &["remote"])?;
+    for line in String::from_utf8_lossy(&out).lines() {
+        let remote = line.trim_end();
+        if remote.is_empty() {
+            continue;
+        }
+        if run(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{remote}/{name}"),
+            ],
+        )
+        .is_ok()
+        {
+            return Ok(Some(remote.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +904,28 @@ mod tests {
         String::from_utf8_lossy(&run(d, args).unwrap())
             .trim_end()
             .to_owned()
+    }
+
+    /// Commits with an explicit committer/author date so date-based ordering is
+    /// deterministic even when two commits would otherwise land in the same second.
+    fn commit_at(d: &Path, msg: &str, date: &str) {
+        crate::run_with_env(
+            d,
+            &[
+                "-c",
+                "user.name=Spork Test",
+                "-c",
+                "user.email=test@spork.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                msg,
+            ],
+            None,
+            &[("GIT_COMMITTER_DATE", date), ("GIT_AUTHOR_DATE", date)],
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -819,6 +1149,7 @@ mod tests {
 
         let cancel = Cancellable::default();
         let result = gitflow_finish(
+            FlowKind::Feature,
             d,
             &FinishOptions {
                 no_fast_forward: true,
@@ -870,6 +1201,7 @@ mod tests {
 
         let cancel = Cancellable::default();
         let result = gitflow_finish(
+            FlowKind::Feature,
             d,
             &FinishOptions {
                 delete_remote: true,
@@ -918,6 +1250,7 @@ mod tests {
 
         let cancel = Cancellable::default();
         let result = gitflow_finish(
+            FlowKind::Feature,
             d,
             &FinishOptions {
                 rebase_before_merge: true,
@@ -958,7 +1291,8 @@ mod tests {
 
         // no rebase: the conflict happens on the merge (step 3)
         let cancel = Cancellable::default();
-        let result = gitflow_finish(d, &FinishOptions::default(), &cancel).unwrap();
+        let result =
+            gitflow_finish(FlowKind::Feature, d, &FinishOptions::default(), &cancel).unwrap();
         assert_eq!(result, FinishResult::Conflicts { step: 3 });
 
         let state = gitflow_finish_state(d).unwrap();
@@ -999,7 +1333,8 @@ mod tests {
         diverging_feature(d);
 
         let cancel = Cancellable::default();
-        let result = gitflow_finish(d, &FinishOptions::default(), &cancel).unwrap();
+        let result =
+            gitflow_finish(FlowKind::Feature, d, &FinishOptions::default(), &cancel).unwrap();
         assert_eq!(result, FinishResult::Conflicts { step: 3 });
         // abort: drop the state file, the conflicted merge is left as-is
         gitflow_abort_finish(d).unwrap();
@@ -1016,8 +1351,335 @@ mod tests {
         gitflow_init(d, &default_config()).unwrap();
         git(d, &["switch", "develop"]);
         let cancel = Cancellable::default();
-        assert!(gitflow_finish(d, &FinishOptions::default(), &cancel).is_err());
+        assert!(gitflow_finish(FlowKind::Feature, d, &FinishOptions::default(), &cancel).is_err());
         // nothing was started: no state file
         assert!(gitflow_finish_state(d).is_none());
+    }
+
+    /// A release branch with one extra commit past develop/master, ready to finish.
+    fn release_branch(d: &Path, version: &str) -> String {
+        git(d, &["init", "-b", "master"]);
+        git(d, &["commit", "--allow-empty", "-m", "first"]);
+        gitflow_init(d, &default_config()).unwrap();
+        let name = gitflow_start(d, FlowKind::Release, version, "develop").unwrap();
+        file(d, "release.txt", &format!("{version}\n"));
+        git(d, &["add", "release.txt"]);
+        git(d, &["commit", "-m", "release content"]);
+        name
+    }
+
+    /// Two parents check: `rev-list --parents -n 1 <ref>` prints the commit plus its parents.
+    fn has_two_parents(d: &Path, refname: &str) -> bool {
+        out(d, &["rev-list", "--parents", "-n", "1", refname])
+            .split_whitespace()
+            .count()
+            == 3
+    }
+
+    #[test]
+    fn finish_release_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        release_branch(d, "1.0.0");
+
+        let cancel = Cancellable::default();
+        let result = gitflow_finish(
+            FlowKind::Release,
+            d,
+            &FinishOptions {
+                tag_message: "Release 1.0.0".to_owned(),
+                ..Default::default()
+            },
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(result, FinishResult::Done);
+
+        // back on develop (the back-merge target)
+        assert_eq!(out(d, &["rev-parse", "--abbrev-ref", "HEAD"]), "develop");
+        // master took a no-ff merge commit
+        assert!(
+            has_two_parents(d, "master"),
+            "master must have a merge commit"
+        );
+        // the annotated version tag exists with the right message
+        assert_eq!(out(d, &["cat-file", "-t", "v1.0.0"]), "tag");
+        assert_eq!(
+            out(
+                d,
+                &[
+                    "for-each-ref",
+                    "--format=%(contents:subject)",
+                    "refs/tags/v1.0.0"
+                ]
+            ),
+            "Release 1.0.0"
+        );
+        // develop took the back-merge (no-ff merge commit)
+        assert!(
+            has_two_parents(d, "develop"),
+            "develop must have the back-merge commit"
+        );
+        // the release branch is gone and the state file removed
+        assert!(!out(d, &["branch", "--list"]).contains("release/1.0.0"));
+        assert!(!state_file(d).unwrap().exists());
+    }
+
+    #[test]
+    fn finish_release_no_back_merge_leaves_develop_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        release_branch(d, "1.0.0");
+        let develop_before = out(d, &["rev-parse", "develop"]);
+
+        let cancel = Cancellable::default();
+        let result = gitflow_finish(
+            FlowKind::Release,
+            d,
+            &FinishOptions {
+                no_back_merge: true,
+                ..Default::default()
+            },
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(result, FinishResult::Done);
+
+        // we stayed on master, develop was never touched
+        assert_eq!(out(d, &["rev-parse", "--abbrev-ref", "HEAD"]), "master");
+        assert_eq!(out(d, &["rev-parse", "develop"]), develop_before);
+        // the tag still gets created
+        assert_eq!(out(d, &["cat-file", "-t", "v1.0.0"]), "tag");
+        assert!(!out(d, &["branch", "--list"]).contains("release/1.0.0"));
+    }
+
+    #[test]
+    fn finish_release_push_after_updates_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let origin = d.join("origin.git");
+        git(d, &["init", "--bare", "-b", "master", "origin.git"]);
+        git(d, &["init", "-b", "master"]);
+        git(d, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(d, &["commit", "--allow-empty", "-m", "first"]);
+        git(d, &["push", "-u", "origin", "master"]);
+        gitflow_init(d, &default_config()).unwrap();
+        git(d, &["push", "-u", "origin", "develop"]);
+        let name = gitflow_start(d, FlowKind::Release, "1.0.0", "develop").unwrap();
+        file(d, "release.txt", "1.0.0\n");
+        git(d, &["add", "release.txt"]);
+        git(d, &["commit", "-m", "release content"]);
+        // the release branch is tracked on origin
+        git(d, &["push", "-u", "origin", &name]);
+
+        let cancel = Cancellable::default();
+        let result = gitflow_finish(
+            FlowKind::Release,
+            d,
+            &FinishOptions {
+                push_after: true,
+                ..Default::default()
+            },
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(result, FinishResult::Done);
+
+        // master, develop and the tag all arrived at the bare origin
+        assert_eq!(
+            out(&origin, &["rev-parse", "master"]),
+            out(d, &["rev-parse", "master"])
+        );
+        assert_eq!(
+            out(&origin, &["rev-parse", "develop"]),
+            out(d, &["rev-parse", "develop"])
+        );
+        assert!(out(&origin, &["tag", "--list"]).contains("v1.0.0"));
+        // the finished release branch was deleted from origin (step 6)
+        assert!(!out(&origin, &["branch", "--list"]).contains("release/1.0.0"));
+    }
+
+    #[test]
+    fn finish_hotfix_back_merges_into_newest_release_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-b", "master"]);
+        git(d, &["commit", "--allow-empty", "-m", "first"]);
+        gitflow_init(d, &default_config()).unwrap();
+        // an existing release branch that a hotfix should back-merge into
+        let release = gitflow_start(d, FlowKind::Release, "1.0.0", "develop").unwrap();
+        file(d, "r.txt", "1.0.0\n");
+        git(d, &["add", "r.txt"]);
+        git(d, &["commit", "-m", "release content"]);
+        git(d, &["switch", "master"]);
+        // the hotfix itself
+        gitflow_start(d, FlowKind::Hotfix, "1.0.1", "master").unwrap();
+        file(d, "fix.txt", "fix\n");
+        git(d, &["add", "fix.txt"]);
+        git(d, &["commit", "-m", "the fix"]);
+        let develop_before = out(d, &["rev-parse", "develop"]);
+
+        let cancel = Cancellable::default();
+        let result =
+            gitflow_finish(FlowKind::Hotfix, d, &FinishOptions::default(), &cancel).unwrap();
+        assert_eq!(result, FinishResult::Done);
+
+        // back on the release branch (the back-merge target), not develop
+        assert_eq!(
+            out(d, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "release/1.0.0"
+        );
+        assert_eq!(release, "release/1.0.0");
+        assert!(
+            has_two_parents(d, "release/1.0.0"),
+            "release branch must have the back-merge"
+        );
+        assert!(
+            has_two_parents(d, "master"),
+            "master must have the merge commit"
+        );
+        // develop was NOT merged into
+        assert_eq!(out(d, &["rev-parse", "develop"]), develop_before);
+        // the tag and the hotfix branch
+        assert_eq!(out(d, &["cat-file", "-t", "v1.0.1"]), "tag");
+        assert!(!out(d, &["branch", "--list"]).contains("hotfix/1.0.1"));
+    }
+
+    #[test]
+    fn finish_hotfix_without_release_back_merges_into_develop() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-b", "master"]);
+        git(d, &["commit", "--allow-empty", "-m", "first"]);
+        gitflow_init(d, &default_config()).unwrap();
+        gitflow_start(d, FlowKind::Hotfix, "1.0.1", "master").unwrap();
+        file(d, "fix.txt", "fix\n");
+        git(d, &["add", "fix.txt"]);
+        git(d, &["commit", "-m", "the fix"]);
+
+        let cancel = Cancellable::default();
+        let result =
+            gitflow_finish(FlowKind::Hotfix, d, &FinishOptions::default(), &cancel).unwrap();
+        assert_eq!(result, FinishResult::Done);
+
+        // no release branch, so the back-merge target falls back to develop
+        assert_eq!(out(d, &["rev-parse", "--abbrev-ref", "HEAD"]), "develop");
+        assert!(
+            has_two_parents(d, "develop"),
+            "develop must have the back-merge"
+        );
+        assert!(has_two_parents(d, "master"));
+        assert_eq!(out(d, &["cat-file", "-t", "v1.0.1"]), "tag");
+        assert!(!out(d, &["branch", "--list"]).contains("hotfix/1.0.1"));
+    }
+
+    #[test]
+    fn finish_release_merge_conflict_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-b", "master"]);
+        git(d, &["commit", "--allow-empty", "-m", "first"]);
+        gitflow_init(d, &default_config()).unwrap();
+        // master and the release branch edit the same file differently
+        git(d, &["switch", "develop"]);
+        file(d, "shared.txt", "base\n");
+        git(d, &["add", "shared.txt"]);
+        git(d, &["commit", "-m", "base file"]);
+        gitflow_start(d, FlowKind::Release, "1.0.0", "develop").unwrap();
+        file(d, "shared.txt", "release line\n");
+        git(d, &["add", "shared.txt"]);
+        git(d, &["commit", "-m", "release edit"]);
+        git(d, &["switch", "master"]);
+        file(d, "shared.txt", "master line\n");
+        git(d, &["add", "shared.txt"]);
+        git(d, &["commit", "-m", "master edit"]);
+        // finish must be called from the release branch itself
+        git(d, &["switch", "release/1.0.0"]);
+
+        // no back-merge: isolate the master merge conflict
+        let cancel = Cancellable::default();
+        let result = gitflow_finish(
+            FlowKind::Release,
+            d,
+            &FinishOptions {
+                no_back_merge: true,
+                ..Default::default()
+            },
+            &cancel,
+        )
+        .unwrap();
+        // stopped on the merge into master (step 2)
+        assert_eq!(result, FinishResult::Conflicts { step: 2 });
+        let state = gitflow_finish_state(d).unwrap();
+        assert_eq!(state.kind, "release");
+        assert_eq!(state.step, 2);
+
+        // resolve and resume: the merge continues, the tag is created, state removed
+        file(d, "shared.txt", "resolved\n");
+        git(d, &["add", "shared.txt"]);
+        let resumed = gitflow_resume_finish(d, &cancel).unwrap();
+        assert_eq!(resumed, FinishResult::Done);
+        assert_eq!(out(d, &["cat-file", "-t", "v1.0.0"]), "tag");
+        assert_eq!(out(d, &["rev-parse", "--abbrev-ref", "HEAD"]), "master");
+        assert!(!out(d, &["branch", "--list"]).contains("release/1.0.0"));
+        assert!(!state_file(d).unwrap().exists());
+    }
+
+    #[test]
+    fn finish_release_requires_a_release_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-b", "master"]);
+        git(d, &["commit", "--allow-empty", "-m", "first"]);
+        gitflow_init(d, &default_config()).unwrap();
+        git(d, &["switch", "develop"]);
+        let cancel = Cancellable::default();
+        assert!(gitflow_finish(FlowKind::Release, d, &FinishOptions::default(), &cancel).is_err());
+        assert!(gitflow_finish_state(d).is_none());
+        // and a hotfix on a non-hotfix branch
+        assert!(gitflow_finish(FlowKind::Hotfix, d, &FinishOptions::default(), &cancel).is_err());
+        assert!(gitflow_finish_state(d).is_none());
+    }
+
+    #[test]
+    fn finish_step_labels_for_release_and_hotfix() {
+        assert_eq!(finish_step_label("release", 1), "switch to master");
+        assert_eq!(finish_step_label("release", 2), "merge into master");
+        assert_eq!(finish_step_label("release", 3), "tag release");
+        assert_eq!(finish_step_label("release", 5), "back-merge into develop");
+        assert_eq!(finish_step_label("release", 7), "push");
+        assert_eq!(finish_step_label("hotfix", 3), "tag hotfix");
+        assert_eq!(
+            finish_step_label("hotfix", 5),
+            "back-merge into release/develop"
+        );
+        assert_eq!(finish_step_label("feature", 3), "merge into develop");
+    }
+
+    #[test]
+    fn latest_release_branch_picks_newest_by_committerdate() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-b", "master"]);
+        git(d, &["commit", "--allow-empty", "-m", "first"]);
+        gitflow_init(d, &default_config()).unwrap();
+        // two release branches; the second is committed later (explicit dates keep the
+        // committer-date ordering deterministic even within the same second)
+        gitflow_start(d, FlowKind::Release, "1.0.0", "develop").unwrap();
+        commit_at(d, "r1", "2024-01-01T10:00:00+00:00");
+        git(d, &["switch", "develop"]);
+        gitflow_start(d, FlowKind::Release, "1.1.0", "develop").unwrap();
+        commit_at(d, "r2", "2024-06-01T10:00:00+00:00");
+
+        assert_eq!(
+            latest_release_branch(d, "release/"),
+            Some("release/1.1.0".to_owned())
+        );
+        // no release branches at all
+        let dir2 = tempfile::tempdir().unwrap();
+        let d2 = dir2.path();
+        git(d2, &["init", "-b", "master"]);
+        git(d2, &["commit", "--allow-empty", "-m", "first"]);
+        assert_eq!(latest_release_branch(d2, "release/"), None);
     }
 }

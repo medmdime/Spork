@@ -496,7 +496,7 @@ impl crate::RepoView {
                         .child(
                             div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!(
                                 "Git-flow finish paused at {}",
-                                finish_step_label(state.step)
+                                finish_step_label(&state.kind, state.step)
                             )),
                         )
                         .child(
@@ -617,7 +617,9 @@ impl crate::RepoView {
         let cancel = self.gitflow_cancel.clone();
         self._gitflow_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = cx
-                .background_spawn(async move { gitflow_finish(&root, &options, &cancel) })
+                .background_spawn(async move {
+                    gitflow_finish(FlowKind::Feature, &root, &options, &cancel)
+                })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.gitflow_busy = false;
@@ -628,7 +630,7 @@ impl crate::RepoView {
                     Ok(FinishResult::Conflicts { step }) => window.push_notification(
                         Notification::warning(format!(
                             "Paused at {label} — resolve the conflicts, then resume.",
-                            label = finish_step_label(step)
+                            label = finish_step_label("feature", step)
                         )),
                         cx,
                     ),
@@ -665,7 +667,7 @@ impl crate::RepoView {
                     Ok(FinishResult::Conflicts { step }) => window.push_notification(
                         Notification::warning(format!(
                             "Still paused at {label} — resolve the conflicts, then resume again.",
-                            label = finish_step_label(step)
+                            label = finish_step_label("feature", step)
                         )),
                         cx,
                     ),

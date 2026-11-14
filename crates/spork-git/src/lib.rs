@@ -1,6 +1,7 @@
 //! The one place Spork runs git (docs/00-overview.md §3.4) plus the ref reader behind the sidebar (docs/specs/M03).
 
 pub mod gitflow;
+pub mod lean;
 
 use std::fmt;
 use std::io;
