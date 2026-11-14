@@ -4,6 +4,8 @@
 //! accepts. Forward patches (stage) keep unselected deletions as context and drop unselected
 //! additions. Reverse patches (unstage, discard; applied with `--reverse`) do the mirror image.
 
+pub mod imagediff;
+
 /// Which side of the diff a line number refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {

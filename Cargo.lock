@@ -5974,6 +5974,9 @@ version = "0.0.1"
 [[package]]
 name = "spork-patch"
 version = "0.0.1"
+dependencies = [
+ "image",
+]
 
 [[package]]
 name = "stable_deref_trait"

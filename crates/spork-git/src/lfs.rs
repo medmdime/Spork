@@ -107,6 +107,60 @@ pub fn lfs_hooks_installed(repo: &Path) -> bool {
         && run(repo, &["config", "--local", "--get", "filter.lfs.clean"]).is_ok()
 }
 
+/// An LFS pointer file: what git stores in the working tree instead of a file whose
+/// content lives in the LFS object store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LfsPointer {
+    /// The object's SHA-256 oid (64 hex characters).
+    pub oid: String,
+    /// The object's size in bytes.
+    pub size: u64,
+}
+
+/// Parse an LFS pointer file:
+///
+/// ```text
+/// version https://git-lfs.github.com/spec/v1
+/// oid sha256:<oid>
+/// size <n>
+/// ```
+///
+/// Trailing whitespace or data after the three lines is tolerated; a pointer that is
+/// missing any line or carries a malformed oid or size is `None`, never a panic.
+pub fn parse_lfs_pointer(text: &str) -> Option<LfsPointer> {
+    let mut version = false;
+    let mut oid = None;
+    let mut size = None;
+    for line in text.lines().map(str::trim) {
+        if line == "version https://git-lfs.github.com/spec/v1" {
+            version = true;
+        } else if let Some(rest) = line.strip_prefix("oid sha256:")
+            && oid.is_none()
+            && is_sha256_oid(rest)
+        {
+            oid = Some(rest.to_owned());
+        } else if let Some(rest) = line.strip_prefix("size ")
+            && size.is_none()
+            && rest.bytes().all(|b| b.is_ascii_digit())
+        {
+            size = rest.parse().ok();
+        }
+    }
+    if version {
+        Some(LfsPointer {
+            oid: oid?,
+            size: size?,
+        })
+    } else {
+        None
+    }
+}
+
+/// A SHA-256 oid: exactly 64 hex characters.
+fn is_sha256_oid(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 // --- Status ------------------------------------------------------------------
 
 /// One Git LFS file as listed by `git lfs ls-files`.
@@ -187,6 +241,16 @@ fn lfs_object_exists(objects: &Path, oid: &str) -> Option<bool> {
         return None;
     }
     Some(objects.join(&oid[..2]).join(&oid[2..4]).join(oid).is_file())
+}
+
+/// The content of an LFS object, read straight from the on-disk store (the
+/// `<git dir>/lfs/objects/<oid[0:2]>/<oid[2:4]>/<oid>` layout git-lfs uses, as in
+/// [`lfs_object_exists`]). `None` when the object is not downloaded, the oid is too
+/// short to address, or the git dir cannot be resolved.
+pub fn lfs_object_content(repo: &Path, oid: &str) -> Option<Vec<u8>> {
+    let (first, second) = oid.get(0..2).zip(oid.get(2..4))?;
+    let objects = lfs_object_dir(repo).ok()?;
+    std::fs::read(objects.join(first).join(second).join(oid)).ok()
 }
 
 // --- Locks -------------------------------------------------------------------
@@ -494,6 +558,69 @@ mod tests {
     }
 
     #[test]
+    fn parses_lfs_pointer_files() {
+        let oid = "97398960288b86af38fa6ab5d4d7627646e25160798c00998f7250efeba4d30c";
+        let text =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 256\n");
+        let p = parse_lfs_pointer(&text).unwrap();
+        assert_eq!(
+            p,
+            LfsPointer {
+                oid: oid.to_owned(),
+                size: 256
+            }
+        );
+
+        // trailing whitespace and data are tolerated
+        let p = parse_lfs_pointer(&format!("{text}\n   \n")).unwrap();
+        assert_eq!((p.oid.as_str(), p.size), (oid, 256));
+    }
+
+    #[test]
+    fn malformed_lfs_pointers_are_none() {
+        let oid = "97398960288b86af38fa6ab5d4d7627646e25160798c00998f7250efeba4d30c";
+        let v = "version https://git-lfs.github.com/spec/v1";
+        assert_eq!(parse_lfs_pointer(""), None);
+        assert_eq!(parse_lfs_pointer("not a pointer\n"), None);
+        // missing the size line
+        assert_eq!(parse_lfs_pointer(&format!("{v}\noid sha256:{oid}\n")), None);
+        // missing the version line
+        assert_eq!(
+            parse_lfs_pointer(&format!("oid sha256:{oid}\nsize 256\n")),
+            None
+        );
+        // a different version
+        assert_eq!(
+            parse_lfs_pointer(&format!(
+                "version https://git-lfs.github.com/spec/v2\noid sha256:{oid}\nsize 256\n"
+            )),
+            None
+        );
+        // a non-sha256 oid
+        assert_eq!(
+            parse_lfs_pointer(&format!("{v}\noid md5:{oid}\nsize 256\n")),
+            None
+        );
+        // an oid of the wrong length
+        assert_eq!(
+            parse_lfs_pointer(&format!("{v}\noid sha256:abc\nsize 256\n")),
+            None
+        );
+        // a non-numeric size
+        assert_eq!(
+            parse_lfs_pointer(&format!("{v}\noid sha256:{oid}\nsize big\n")),
+            None
+        );
+        // an overflowing size
+        assert_eq!(
+            parse_lfs_pointer(&format!(
+                "{v}\noid sha256:{oid}\nsize 99999999999999999999999\n"
+            )),
+            None
+        );
+    }
+
+    #[test]
     fn parses_ls_files_json_with_space_in_path() {
         let json = r#"{
  "files": [
@@ -665,6 +792,33 @@ mod tests {
         assert!(lfs_track(d, "").is_err());
         assert!(lfs_track(d, " *.bin ").is_err());
         assert!(lfs_untrack(d, "").is_err());
+    }
+
+    #[test]
+    fn lfs_object_content_reads_downloaded_objects() {
+        if !require_lfs() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        lfs_install_hooks(d).unwrap();
+        lfs_track(d, "*.bin").unwrap();
+
+        let content: Vec<u8> = (0..=255u8).collect();
+        std::fs::write(d.join("data.bin"), &content).unwrap();
+        git(d, &["add", "data.bin"]);
+        git(d, &["commit", "-q", "-m", "lfs bin"]);
+
+        // a downloaded object: the store holds exactly the committed bytes
+        let files = lfs_ls_files(d).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(lfs_object_content(d, &files[0].oid), Some(content));
+
+        // an oid that was never fetched, and one too short to address: None
+        let missing = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        assert_eq!(lfs_object_content(d, missing), None);
+        assert_eq!(lfs_object_content(d, "ab"), None);
     }
 
     #[test]
