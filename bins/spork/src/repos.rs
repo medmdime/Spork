@@ -100,6 +100,7 @@ impl RepoView {
         self.search_cancel.kill();
         self.view = View::History;
         self._watcher = None;
+        self.gitflow_cancel.kill();
         self.reload(cx);
     }
 
@@ -213,7 +214,7 @@ impl RepoView {
             .ghost()
             .label(name)
             .icon(IconName::ChevronDown)
-            .dropdown_menu(move |menu, _, _| {
+            .dropdown_menu(move |menu, window, cx| {
                 let mut menu = menu;
                 for path in &recent {
                     let (view, path) = (view.clone(), path.clone());
@@ -233,9 +234,16 @@ impl RepoView {
                             view.update(cx, |this, cx| f(this, window, cx))
                         })
                     };
-                menu.item(action("Open repository…", RepoView::open_repo_dialog))
+                let menu = menu
+                    .item(action("Open repository…", RepoView::open_repo_dialog))
                     .item(action("Clone repository…", RepoView::clone_dialog))
                     .item(action("New repository…", RepoView::new_repo_dialog))
+                    .item(PopupMenuItem::separator());
+                let gitflow_view = view.clone();
+                menu.submenu("Git Flow", window, cx, move |menu, _window, cx| {
+                    let (config, current) = gitflow_view.read(cx).gitflow_menu_state();
+                    crate::gitflow::gitflow_submenu(menu, config, current, gitflow_view.clone())
+                })
             })
     }
 

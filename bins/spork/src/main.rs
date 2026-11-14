@@ -5,6 +5,7 @@ mod blame;
 mod branches;
 mod changes;
 mod file_history;
+mod gitflow;
 mod history;
 mod operations;
 mod rebase;
@@ -128,6 +129,20 @@ struct RepoView {
     _blame_task: Option<Task<()>>,
     /// Kept alive so the blame search input keeps notifying (blame.rs).
     _blame_search_events: Subscription,
+    // git flow (M13 §1–§3, gitflow.rs)
+    gitflow_init_production: Entity<InputState>,
+    gitflow_init_development: Entity<InputState>,
+    gitflow_init_feature: Entity<InputState>,
+    gitflow_init_release: Entity<InputState>,
+    gitflow_init_hotfix: Entity<InputState>,
+    gitflow_init_bugfix: Entity<InputState>,
+    gitflow_init_support: Entity<InputState>,
+    gitflow_init_versiontag: Entity<InputState>,
+    /// Kills an in-flight git-flow background git call on a repo switch.
+    gitflow_cancel: spork_git::Cancellable,
+    /// A git-flow init / start / finish / resume is running.
+    gitflow_busy: bool,
+    _gitflow_task: Option<Task<()>>,
 }
 
 struct Loaded {
@@ -140,6 +155,10 @@ struct Loaded {
     worktrees: Vec<Worktree>,
     submodules: Vec<Submodule>,
     history: History,
+    /// Git Flow config of the repository (M13 §1); `None` until initialized.
+    gitflow: Option<spork_git::gitflow::GitflowConfig>,
+    /// A finish interrupted by conflicts, possibly in a previous session (M13 §3).
+    paused_finish: Option<spork_git::gitflow::FinishState>,
 }
 
 /// Deep-search state (M05 §5): results replace the history list while the Search view is active.
@@ -273,6 +292,18 @@ impl RepoView {
             blame_search,
             _blame_task: None,
             _blame_search_events,
+            gitflow_init_production: cx.new(|cx| InputState::new(window, cx).placeholder("main")),
+            gitflow_init_development: cx
+                .new(|cx| InputState::new(window, cx).placeholder("develop")),
+            gitflow_init_feature: cx.new(|cx| InputState::new(window, cx).placeholder("feature/")),
+            gitflow_init_release: cx.new(|cx| InputState::new(window, cx).placeholder("release/")),
+            gitflow_init_hotfix: cx.new(|cx| InputState::new(window, cx).placeholder("hotfix/")),
+            gitflow_init_bugfix: cx.new(|cx| InputState::new(window, cx).placeholder("bugfix/")),
+            gitflow_init_support: cx.new(|cx| InputState::new(window, cx).placeholder("support/")),
+            gitflow_init_versiontag: cx.new(|cx| InputState::new(window, cx).placeholder("")),
+            gitflow_cancel: spork_git::Cancellable::default(),
+            gitflow_busy: false,
+            _gitflow_task: None,
         };
         view.reload(cx);
         view
@@ -453,6 +484,9 @@ fn load(path: &Path) -> Result<Loaded, GitError> {
         worktrees,
         submodules,
         history,
+        // best effort: a missing / broken config or state file just hides the menu entry / banner
+        gitflow: spork_git::gitflow::gitflow_config(&root),
+        paused_finish: spork_git::gitflow::gitflow_finish_state(&root),
         root,
     })
 }
@@ -738,7 +772,9 @@ impl RepoView {
             .bg(theme.background)
             .rounded(theme.radius)
             .overflow_hidden();
-        let panel = panel.children(self.op_banner(cx));
+        let panel = panel
+            .children(self.op_banner(cx))
+            .children(self.gitflow_finish_banner(cx));
 
         if self.view == View::Rebase {
             let plan = self.rebase_view(cx);
