@@ -1,5 +1,7 @@
 //! The one place Spork runs git (docs/00-overview.md §3.4) plus the ref reader behind the sidebar (docs/specs/M03).
 
+pub mod gitflow;
+
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -114,7 +116,7 @@ pub fn run_cancellable(
 
 /// Like [`run_with_input`], with extra environment variables for this one command.
 /// When `cancel` is given, the child can be killed through the handle (M05 §5).
-fn run_with_env(
+pub(crate) fn run_with_env(
     repo: &Path,
     args: &[&str],
     input: Option<&[u8]>,
@@ -310,7 +312,7 @@ pub fn parse_refs(out: &str) -> Vec<Ref> {
 }
 
 /// `"ahead 2, behind 1"` / `"ahead 2"` / `"gone"` / `""` → (ahead, behind, gone).
-fn parse_track(track: &str) -> (u32, u32, bool) {
+pub(crate) fn parse_track(track: &str) -> (u32, u32, bool) {
     if track == "gone" {
         return (0, 0, true);
     }
@@ -1128,7 +1130,10 @@ pub enum Outcome {
 }
 
 /// Turns "git stopped because of conflicts" into `Outcome::Conflicts` instead of an error.
-fn allow_conflicts(repo: &Path, result: Result<Vec<u8>, GitError>) -> Result<Outcome, GitError> {
+pub(crate) fn allow_conflicts(
+    repo: &Path,
+    result: Result<Vec<u8>, GitError>,
+) -> Result<Outcome, GitError> {
     match result {
         Ok(_) => Ok(Outcome::Done),
         Err(e) => {
@@ -1883,10 +1888,10 @@ pub mod askpass {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn git(dir: &Path, args: &[&str]) {
+    pub(crate) fn git(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .args([
                 "-c",
